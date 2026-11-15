@@ -17,10 +17,10 @@ jobs:
       - name: Apply v0.2.58 Bugfixes Patch
         run: |
           base64 -d << 'EOF' | gunzip | git apply -v
-          H4sIAAAAAAAEAM19eVcbV7bv3+RTnGa5e0kgF5KY3SFpjEmH2x54gNP3rqwsdyEVUG1JpVsqPLSb
-          u2Q7jGayDcYDjo0DNrFjwPHEzHfpqErSX/kKb+9zTpWqVCUMTvq+V3GQVHXGffb+7eEMFZV7esjR
-          o72yRsQqMZms6u6XY1GhVxWjMUk4r6VIt+ftT+REVLpEqhtqa6QeURDq6ntqe+qDJBQM1tXUfHL0
-          6NES5X1SWVlZqsw//YkcDdUFGkgl/Qs/xURUVeQoufIJMa+qKpLdvq2/vKs/2DUeD/+yPZ4dHTHm
+          H4sIAAAAAAAEAM19aVcbR9bwZ/IrajieeSSQG0nsntgZG5OEiRdegzPPc3JyPI3UgMaSWtPd2GY8
+          PEe2w2o2L3gDLzhgEy+A443VfHj/SaJuSZ/yF957q6pb3eoWi5OZdzQZI3XXeuvudetWNNbZSfbv
+          74ppRKwSU6mqjp5YPCp0KWI0LglnNZV0eD7+JJaMShdIdUNtjdQpCkJdfWdtZ32QhILBupqaT/bv
+          31+ivU8qKytLtfmnP5H9obpAA6mk/8JPMRlV5FiUXPyEmJ+qKpLdvq2/vKs/2DUeD/+yPZ4dHTHm
           f9Sn3mfWJ/Spu8bcu9zToeyDO/rKaO77wcz2/ezWs+zWS+PubnZx05h7xjL+nL7mKDT37Nvsox9+
           2R7JPbtKokokVZWUtR4xFksJ8SjJ/vgjqSW5sWu/bI/+sn3fWJ3K7awYMxv62HL++k7u6VVoMzRF
           33inzy+zBuVW3xh3J/PD4/rQPWN9MLd3L7OehkfOrjxY11c3Mutj7Bk0v8r4aQE+MlvpzMYINFKf
@@ -223,44 +223,55 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Go 1.24
+      - name: Set up Go 1.26.10
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.26.10'
           cache-dependency-path: engine/go.sum
 
       - name: Run Engine Unit Tests & Vet
         working-directory: engine
+        env:
+          GOTOOLCHAIN: "go1.26.10"
         run: |
           go vet ./...
           go test -v -run "TestStatusJSONShape|TestConnectWithoutBackendFailsLoudly|TestConnectThenDisconnect|TestDisconnectDuringConnectingCancels|TestStaleConnectCannotReviveAfterStop|TestRenderUAPI|TestMarkSubExitStoppedDoesNotBreakNormalConnect" .
           go test -v -run "TestParse|TestClassify|TestComplement|TestRule" ./warp
 
       - name: Install gomobile and build engine.aar
+        env:
+          JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF-8"
+          GOTOOLCHAIN: "go1.26.10"
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260217195705-b56b3793a9c4
-          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260217195705-b56b3793a9c4
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME}"
           export PATH="$PATH:$(go env GOPATH)/bin"
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
           gomobile init
           mkdir -p app/libs
           cd engine
-          go get golang.org/x/mobile/bind@v0.0.0-20260217195705-b56b3793a9c4
-          gomobile bind -v -target=android/arm64 -androidapi 24 -javapkg=com.xiaohe -ldflags="-checklinkname=0" -o ../app/libs/engine.aar .
+          gomobile bind -v \
+            -javapkg=com.xiaohe \
+            -target=android/arm64 \
+            -androidapi=24 \
+            -ldflags="-w -s" \
+            -tags="cmfa,with_gvisor" \
+            -o ../app/libs/engine.aar \
+            ./
           ls -lh ../app/libs/engine.aar
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
 
       - name: Build Debug APK
         run: |
-          gradle :app:assembleDebug --no-daemon --stacktrace
-          cp app/build/outputs/apk/debug/app-debug.apk xehn-0.2.58.apk
-          ls -lh xehn-0.2.58.apk
+          sed -i 's|mirrors.cloud.tencent.com/gradle|services.gradle.org/distributions|g' gradle/wrapper/gradle-wrapper.properties
+          sed -i '/maven.aliyun.com/d' settings.gradle.kts
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          ls -lh app/build/outputs/apk/debug/
+          sha256sum app/build/outputs/apk/debug/*.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: xehn-android-apk-v0.2.58
-          path: xehn-0.2.58.apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
