@@ -38,9 +38,12 @@ const (
 	// VPN Gate nodes churn fast, but re-fetching on every dropdown open would
 	// hammer the API for a list that is only minutes stale.
 	vpnGateCacheTTL = 3 * time.Hour
-	// vpnGateMaxNodes caps the cached pool: the API can return hundreds of
-	// entries, most of them dead, and the cache file is read on UI paths.
-	vpnGateMaxNodes = 200
+	// vpnGateMaxNodes caps the cached pool after merging recent slices.
+	vpnGateMaxNodes = 500
+	// vpnGateMergeTTL keeps nodes seen in earlier slices (especially rarer
+	// countries) across refreshes so a single truncated/rotated API slice does
+	// not wipe out previously discovered regions.
+	vpnGateMergeTTL = 6 * time.Hour
 	// vpnGateConnectNodes is the candidate cap handed to one connect, matching
 	// the phone client's OPENVPN_CANDIDATE_CAP. The attempt cap is smaller; the
 	// 10-minute failure memory moves later retries down this list.
@@ -93,8 +96,9 @@ type vpnGateNode struct {
 	// Class is the two-way line classification (residential or datacenter).
 	// public-vpn-* is the author's datacenter fleet; every other volunteer
 	// relay stays residential unless ip-api proves hosting.
-	Class   string `json:"class"`
-	Profile string `json:"profile"`
+	Class   string    `json:"class"`
+	Profile string    `json:"profile"`
+	SeenAt  time.Time `json:"seen_at,omitempty"`
 	// LatencyMS is measured locally (through the WARP underlay when the list
 	// itself had to be fetched that way); never persisted.
 	LatencyMS int64 `json:"-"`
@@ -520,6 +524,66 @@ func saveVPNGateCache(nodes []vpnGateNode) {
 	_ = os.WriteFile(p, raw, 0o600)
 }
 
+// mergeVPNGateNodes combines a newly fetched slice with unexpired nodes from
+// earlier slices. Fresh entries always win (updating live session/speed stats);
+// earlier entries survive up to vpnGateMergeTTL so rare countries or throttled
+// API responses do not wipe out the pool.
+func mergeVPNGateNodes(existing, fresh []vpnGateNode, fallbackAt, now time.Time) []vpnGateNode {
+	merged := make([]vpnGateNode, 0, len(fresh)+len(existing))
+	seen := make(map[string]bool, len(fresh)+len(existing))
+	for _, n := range fresh {
+		id := n.id()
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		n.SeenAt = now
+		merged = append(merged, n)
+	}
+	var kept []vpnGateNode
+	for _, n := range existing {
+		id := n.id()
+		if id == "" || seen[id] {
+			continue
+		}
+		at := n.SeenAt
+		if at.IsZero() {
+			at = fallbackAt
+		}
+		if at.IsZero() || now.Sub(at) >= vpnGateMergeTTL {
+			continue
+		}
+		seen[id] = true
+		n.SeenAt = at
+		kept = append(kept, n)
+	}
+	// Prefer the freshest kept entries if the combined pool exceeds the cap.
+	sort.SliceStable(kept, func(i, j int) bool {
+		if !kept[i].SeenAt.Equal(kept[j].SeenAt) {
+			return kept[i].SeenAt.After(kept[j].SeenAt)
+		}
+		return vpnGateQualityScore(kept[i]) > vpnGateQualityScore(kept[j])
+	})
+	merged = append(merged, kept...)
+	if len(merged) > vpnGateMaxNodes {
+		merged = merged[:vpnGateMaxNodes]
+	}
+	sortVPNGateNodes(merged)
+	return merged
+}
+
+// mergeAndSaveVPNGateCache merges fresh nodes with any unexpired cached nodes,
+// writes the combined pool to disk, and returns the merged list.
+func mergeAndSaveVPNGateCache(fresh []vpnGateNode) []vpnGateNode {
+	if len(fresh) == 0 {
+		return fresh
+	}
+	existing, at := loadVPNGateCache()
+	merged := mergeVPNGateNodes(existing, fresh, at, time.Now())
+	saveVPNGateCache(merged)
+	return merged
+}
+
 // vpnGateUnderlayFile is the last endpoint that carried a successful WARP
 // fetch. It is deliberately independent of the scan cache's TTL: VPN Gate is
 // blocked on exactly the networks where a fetch matters, and reusing a known
@@ -616,7 +680,7 @@ func vpnGateNodesFor(ctx context.Context, results []cachedEndpoint, run protoRun
 		}
 		return nil, err
 	}
-	saveVPNGateCache(fresh)
+	fresh = mergeAndSaveVPNGateCache(fresh)
 	return fresh, nil
 }
 
@@ -1497,10 +1561,47 @@ func measureVPNGateLatency(ctx context.Context, nodes []vpnGateNode) {
 	})
 }
 
+// vpnGateQualityScore estimates a relay's usable throughput from its reported
+// bandwidth, active session count, and latency. Crowded volunteer relays
+// (60–150+ concurrent users) saturate their home router/CPU even on gigabit
+// links, while low-session high-bandwidth relays consistently deliver far more
+// throughput. Returns 0 when Speed is unknown so synthetic fixtures keep plain
+// latency ordering.
+func vpnGateQualityScore(n vpnGateNode) int64 {
+	if n.Speed <= 0 {
+		return 0
+	}
+	sessions := n.Sessions
+	if sessions < 0 {
+		sessions = 0
+	}
+	perUser := n.Speed / int64(sessions+5)
+	if sessions == 0 {
+		// Relays with zero active users are disproportionately half-broken or
+		// firewalled volunteers whose OpenVPN handshake hangs; rank them below
+		// proven-active relays without hiding them.
+		perUser /= 4
+	} else if sessions >= 60 {
+		perUser /= 2
+	}
+	lat := n.LatencyMS
+	if lat <= 0 {
+		lat = int64(n.PingMS)
+	}
+	if lat <= 0 {
+		lat = 100
+	}
+	if lat < 30 {
+		lat = 30
+	}
+	return perUser / (lat + 120)
+}
+
 // sortVPNGateNodesByLatency is the picker's order: the residential block before
 // the datacenter fleet, then this client's own measured throughput (fast,
-// untested, slow), then measured latency, then the API's own ping/score for
-// anything the probe could not reach.
+// untested, slow), then locally reachable nodes before unprobed ones, then
+// per-session bandwidth quality (rewarding high-bandwidth, low-crowd relays),
+// then latency/ping/score tie-breakers.
 func sortVPNGateNodesByLatency(nodes []vpnGateNode) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		a, b := nodes[i], nodes[j]
@@ -1517,6 +1618,10 @@ func sortVPNGateNodesByLatency(nodes []vpnGateNode) {
 		am, bm := a.LatencyMS > 0, b.LatencyMS > 0
 		if am != bm {
 			return am
+		}
+		qa, qb := vpnGateQualityScore(a), vpnGateQualityScore(b)
+		if qa > 0 && qb > 0 && qa != qb {
+			return qa > qb
 		}
 		if am && a.LatencyMS != b.LatencyMS {
 			return a.LatencyMS < b.LatencyMS

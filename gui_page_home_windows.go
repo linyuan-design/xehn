@@ -593,6 +593,11 @@ func (u *natUI) vpnNodesIn(cc string) []vpnGateNode {
 	var out []vpnGateNode
 	for _, n := range u.m.vpnNodes {
 		if strings.EqualFold(n.CountryShort, cc) {
+			if n.MeasuredBps == 0 && len(u.m.vpnSpeeds) > 0 {
+				if bps, ok := u.m.vpnSpeeds[n.id()]; ok {
+					n.MeasuredBps = bps
+				}
+			}
 			out = append(out, n)
 		}
 	}
@@ -675,7 +680,7 @@ func (u *natUI) paintVPNRegionPopup(c *walk.Canvas, ax, ay, aw, ah float64) {
 	const (
 		rowH    = 34.0
 		pad     = 6.0
-		pw      = 348.0
+		pw      = 408.0
 		headerH = 36.0
 	)
 	empty := len(u.m.vpnCountries) == 0
@@ -815,6 +820,46 @@ func (u *natUI) vpnClassColor(class string) walk.Color {
 	return th.text
 }
 
+// vpnNodeMetricsLabel builds the compact right-hand stats for a relay row:
+// measured speed (when known), reported link bandwidth, active sessions, and
+// latency / UDP indicator so users can spot fast, uncrowded relays at a glance.
+func vpnNodeMetricsLabel(n vpnGateNode) string {
+	var parts []string
+	if n.MeasuredBps > 0 {
+		if n.MeasuredBps >= 1<<20 {
+			parts = append(parts, fmt.Sprintf("实测%.1fM/s", float64(n.MeasuredBps)/(1<<20)))
+		} else {
+			parts = append(parts, fmt.Sprintf("实测%dK/s", n.MeasuredBps/1024))
+		}
+	}
+	if n.Speed > 0 {
+		mbps := n.Speed / 1_000_000
+		if mbps < 1 {
+			mbps = 1
+		}
+		parts = append(parts, fmt.Sprintf("%dM", mbps))
+		parts = append(parts, fmt.Sprintf("%d人", n.Sessions))
+	} else if n.Sessions > 0 {
+		parts = append(parts, fmt.Sprintf("%d人", n.Sessions))
+	}
+	if n.Proto == "udp" {
+		if n.LatencyMS > 0 {
+			parts = append(parts, fmt.Sprintf("UDP %dms", n.LatencyMS))
+		} else if n.PingMS > 0 {
+			parts = append(parts, fmt.Sprintf("UDP %dms", n.PingMS))
+		} else {
+			parts = append(parts, "UDP")
+		}
+	} else if n.LatencyMS > 0 {
+		parts = append(parts, fmt.Sprintf("%dms", n.LatencyMS))
+	} else if n.PingMS > 0 {
+		parts = append(parts, fmt.Sprintf("自报%dms", n.PingMS))
+	} else if len(parts) == 0 {
+		return vpnNodeLatencyLabel(n)
+	}
+	return strings.Join(parts, " · ")
+}
+
 func (u *natUI) vpnNodePopupRow(c *walk.Canvas, x, y, w, h float64, n vpnGateNode, cur bool) {
 	id := "pickvpnnode:" + n.id()
 	r := u.r(x+6, y, w-12, h)
@@ -823,10 +868,10 @@ func (u *natUI) vpnNodePopupRow(c *walk.Canvas, x, y, w, h float64, n vpnGateNod
 	}
 	u.circleFill(c, th.faint, x+20, y+h/2, 3)
 	// Slot only, coloured by class; the class word is inside the slot name.
-	u.txt(c, x+34, y+(h-20)/2, w-34-124, 20, u.vpnNodeSlot(n), u.f.f10, u.vpnClassColor(n.classKey()))
-	u.textR(c, vpnNodeLatencyLabel(n), u.f.f8, th.faint, u.r(x+w-150, y+(h-18)/2, 96, 18))
+	u.txt(c, x+34, y+(h-20)/2, 112, 20, u.vpnNodeSlot(n), u.f.f10, u.vpnClassColor(n.classKey()))
+	u.textR(c, vpnNodeMetricsLabel(n), u.f.f8, th.faint, u.r(x+146, y+(h-18)/2, w-146-42, 18))
 	if cur {
-		u.textC(c, "✓", u.f.f10, th.accent, u.r(x+w-46, y, 28, h))
+		u.textC(c, "✓", u.f.f10, th.accent, u.r(x+w-42, y, 28, h))
 	}
 	u.addSpot(id, r, true)
 }

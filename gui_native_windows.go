@@ -79,7 +79,8 @@ type natModel struct {
 	// pool so an expanded country can list its relays with measured latency.
 	vpnNodes     []vpnGateNode
 	vpnCountries []vpnGateCountry
-	vpnExpanded  string // country whose node list is open in the popup
+	vpnSpeeds    map[string]int64 // cached measured bps from vpngate-speeds.json for picker ranking/display
+	vpnExpanded  string           // country whose node list is open in the popup
 	vpnPoolBusy  bool
 	vpnPoolNote  string
 	vpnScroll    int  // vpnregion popup scroll (rows)
@@ -1059,6 +1060,7 @@ func (u *natUI) refreshVPNGatePool(force ...bool) {
 	}
 	forced := len(force) > 0 && force[0]
 	nodes, at := loadVPNGateCache()
+	u.m.vpnSpeeds = vpnGateSpeedSnapshot()
 	stale := forced || len(nodes) == 0 || time.Since(at) >= vpnGateCacheTTL
 	if len(nodes) > 0 {
 		u.m.vpnNodes = nodes
@@ -1075,10 +1077,13 @@ func (u *natUI) refreshVPNGatePool(force ...bool) {
 	go func() {
 		fresh, route, err := u.fetchVPNGatePool()
 		if len(fresh) > 0 {
-			saveVPNGateCache(fresh)
+			fresh = mergeAndSaveVPNGateCache(fresh)
+			sortVPNGateNodesByLatency(fresh)
 		}
+		speeds := vpnGateSpeedSnapshot()
 		u.sync(func() {
 			u.m.vpnPoolBusy = false
+			u.m.vpnSpeeds = speeds
 			switch {
 			case len(fresh) > 0:
 				u.m.vpnNodes = fresh
@@ -1507,6 +1512,7 @@ func (u *natUI) action(id string) {
 			m.dropOpen = which
 			if which == "vpnregion" {
 				m.vpnScroll = 0
+				m.vpnSpeeds = vpnGateSpeedSnapshot()
 				if len(m.vpnCountries) == 0 {
 					u.refreshVPNGatePool()
 				} else if !m.vpnMeasured {
