@@ -273,7 +273,7 @@ func runCachedScan(ctx context.Context, opts options) ([]cachedEndpoint, protoRu
 	if !opts.scanNow {
 		if raw, ok := store.Get(key); ok {
 			var cs cachedScan
-			if json.Unmarshal(raw, &cs) == nil {
+			if json.Unmarshal(raw, &cs) == nil && len(cs.Results) > 0 {
 				if opts.through != "" {
 					stageMsg(fmt.Sprintf("[%s] 使用缓存端点（%d 个，扫描于 %s）",
 						protoLabel(opts.proto), len(cs.Results), cs.At.Format("01-02 15:04")))
@@ -294,12 +294,22 @@ func runCachedScan(ctx context.Context, opts options) ([]cachedEndpoint, protoRu
 	}
 	stageMsg(fmt.Sprintf("[%s] 端点扫描完成（%d 个结果）", protoLabel(opts.proto), len(results)))
 	// The cache's Proto records the user-facing protocol the scan ran under
-	// ("wwarp" for chains) so a later read can tell the two apart.
+	// ("wwarp" for chains) so a later read can tell the two apart. Never
+	// overwrite a working cache with an empty result from a transient outage.
 	cs := cachedScan{Proto: scanKeyFor(opts), IPv6: opts.ipv6, At: time.Now(), Results: results}
+	putCachedScan(store, key, cs)
+	return results, run, nil
+}
+
+// putCachedScan stores cs only when it holds at least one working endpoint,
+// preventing a transient zero-result sweep from wiping out a good cache.
+func putCachedScan(store *cache.Store, key string, cs cachedScan) {
+	if store == nil || len(cs.Results) == 0 {
+		return
+	}
 	if raw, err := json.Marshal(cs); err == nil {
 		_ = store.Put(key, raw)
 	}
-	return results, run, nil
 }
 
 func mustParseProto(p string) protoRun {

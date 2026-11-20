@@ -55,7 +55,12 @@ const (
 	// already ordered (residential block first, then the datacenter fleet), so six
 	// attempts give the failover chain room without turning one connect into a
 	// multi-minute walk through dead nodes.
-	openvpnMaxAttempts = 6
+	openvpnMaxAttempts = 8
+	// openvpnMaxTimeoutsPerBase caps consecutive OpenVPN handshake timeouts on
+	// an unconfirmed WARP base endpoint before rotating to the next base
+	// candidate. Without this, one dead or DPI-dropped underlay (e.g. UDP 2408)
+	// burns the whole attempt budget on cands[0] and blacklists healthy relays.
+	openvpnMaxTimeoutsPerBase = 2
 	// openvpnWarmupWindow is how long one relay gets to complete its OpenVPN
 	// handshake. mihomo detaches the handshake from the inbound dial (see
 	// openvpnHandshakeTimeout), so the first client request necessarily fails;
@@ -78,9 +83,12 @@ const (
 	// crawl; the connect loop rotates past up to openvpnSpeedRetries of them,
 	// then keeps the next working relay anyway because slow beats nothing.
 	// The floor sits far above the generic gate's ~11 KB/s, which this relay
-	// class was passing while delivering ~14 KB/s.
+	// class was passing while delivering ~14 KB/s. On a 512 KiB single-stream
+	// double-tunnel probe, TCP slow-start caps even fast relays around
+	// 120–250 KB/s, so 150 KB/s with at most 1 retry avoids discarding usable
+	// exits while still skipping genuinely stalled ones.
 	openvpnMinBps       = 150 * 1024
-	openvpnSpeedRetries = 2
+	openvpnSpeedRetries = 1
 )
 
 // slowRelayError marks a relay that passed every data-plane check but measured
@@ -91,6 +99,86 @@ type slowRelayError struct{ bps int64 }
 
 func (e *slowRelayError) Error() string {
 	return fmt.Sprintf("出口实测速度过慢（≈%d KB/s，低于 %d KB/s）", e.bps/1024, openvpnMinBps/1024)
+}
+
+// openvpnHandshakeTimeoutError marks an OpenVPN relay that never completed its
+// handshake within openvpnWarmupWindow. Consecutive timeouts on an unconfirmed
+// base endpoint indicate the WARP underlay itself may be unable to carry data.
+type openvpnHandshakeTimeoutError struct {
+	window time.Duration
+	err    error
+}
+
+func (e *openvpnHandshakeTimeoutError) Error() string {
+	return fmt.Sprintf("OpenVPN 中继握手超时（%s 内未建链）: %v", e.window, e.err)
+}
+
+func (e *openvpnHandshakeTimeoutError) Unwrap() error { return e.err }
+
+// openvpnBaseTracker decides whether a failed relay attempt on one WARP base
+// endpoint should continue trying other relays on the same underlay or rotate
+// to the next base endpoint.
+type openvpnBaseTracker struct {
+	confirmed     bool
+	timeouts      int
+	suspectRelays []string
+}
+
+func isOpenVPNBaseConfirmedErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	var slow *slowRelayError
+	if errors.As(err, &slow) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "AUTH_FAILED") || strings.Contains(msg, "数据面验证失败")
+}
+
+func isOpenVPNBaseSuspectErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var to *openvpnHandshakeTimeoutError
+	if errors.As(err, &to) {
+		return true
+	}
+	return strings.Contains(err.Error(), "base endpoint")
+}
+
+// record classifies one failed relay attempt on the current base endpoint.
+// rotateBase is true when the loop should move to the next base endpoint;
+// clearRelays returns relay IDs that were tentatively marked failed on this
+// suspected-dead base and should be un-blacklisted; markFailed indicates
+// whether relayID should be recorded in the failure memory.
+func (tr *openvpnBaseTracker) record(relayID string, err error, hasMoreBases bool) (rotateBase bool, clearRelays []string, markFailed bool) {
+	if isOpenVPNBaseConfirmedErr(err) {
+		tr.confirmed = true
+		tr.timeouts = 0
+		tr.suspectRelays = nil
+		var slow *slowRelayError
+		if errors.As(err, &slow) {
+			return false, nil, false
+		}
+		return false, nil, true
+	}
+	if err != nil && strings.Contains(err.Error(), "base endpoint") {
+		clear := append([]string(nil), tr.suspectRelays...)
+		tr.suspectRelays = nil
+		return hasMoreBases, clear, false
+	}
+	if isOpenVPNBaseSuspectErr(err) && !tr.confirmed && hasMoreBases {
+		tr.timeouts++
+		if tr.timeouts >= openvpnMaxTimeoutsPerBase {
+			clear := append([]string(nil), tr.suspectRelays...)
+			tr.suspectRelays = nil
+			return true, clear, false
+		}
+		tr.suspectRelays = append(tr.suspectRelays, relayID)
+		return false, nil, true
+	}
+	return false, nil, true
 }
 
 // proxyHelperAllowed gates the UAC elevation fallback: only the windowsgui
@@ -752,8 +840,39 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	var lastErr error
 	tried := 0
 	slowRejects := 0
-	for _, ce := range cands {
-		for i := range relays {
+	relayIdx := 0
+	var (
+		bestSlowBase cachedEndpoint
+		bestSlowNode *vpnGateNode
+		bestSlowBps  int64
+	)
+	finishOpenVPN := func(state clientState, node vpnGateNode) error {
+		clearVPNGateFailure(node.id())
+		rememberLastGoodVPNGate(node)
+		if err := saveState(state); err != nil {
+			fmt.Fprintln(os.Stderr, errPal.warn("state not persisted: "+err.Error()))
+		}
+		stageMsg(fmt.Sprintf("[%s] 连接成功（出口 = VPN Gate %s）", label, node.CountryShort))
+		// Say it out loud when the session landed somewhere else: the
+		// region is a preference, so a fallback is legitimate — but a
+		// silent one looks like the selector is broken.
+		if opts.openvpnRegion != "" && !strings.EqualFold(node.CountryShort, opts.openvpnRegion) {
+			stageMsg(fmt.Sprintf("[%s] 注意：所选地区 %s 的节点都没连上，本次已改用 %s",
+				label, opts.openvpnRegion, node.CountryShort))
+		}
+		fmt.Fprintln(os.Stderr, errPal.ok(state.statusLine()))
+		if opts.tunMode {
+			fmt.Fprintln(os.Stderr, errPal.warn("TUN mode requires running with administrator rights"))
+		}
+		if !opts.noGuard {
+			ensureSessionGuard(state)
+		}
+		return nil
+	}
+	for baseIdx, ce := range cands {
+		var baseTrack openvpnBaseTracker
+		hasMoreBases := baseIdx < len(cands)-1
+		for step := 0; step < len(relays); step++ {
 			if tried >= openvpnMaxAttempts {
 				break
 			}
@@ -764,7 +883,8 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 				return err
 			}
 			tried++
-			node := relays[i]
+			node := relays[relayIdx%len(relays)]
+			relayIdx++
 			opts.openvpnNode = &node
 			stageMsg(fmt.Sprintf("[%s] 基础端点 %s + 出口节点 %s（%s，组合 %d/%d）…",
 				label, ce.Endpoint, node.id(), node.CountryShort, tried, min(openvpnMaxAttempts, len(cands)*len(relays))))
@@ -777,11 +897,18 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 				if errors.As(serr, &slow) {
 					// The relay works; only its throughput is unusable. Keep it
 					// out of the failure memory — the speed memory already ranks
-					// it behind everything else — and spend the next attempt on a
-					// different relay.
+					// it behind everything else — remember the fastest working
+					// candidate as a fallback, and try another relay.
+					baseTrack.record(node.id(), serr, hasMoreBases)
+					if slow.bps > bestSlowBps {
+						nCopy := node
+						bestSlowBase = ce
+						bestSlowNode = &nCopy
+						bestSlowBps = slow.bps
+					}
 					lastErr = serr
 					slowRejects++
-					stageMsg(fmt.Sprintf("[%s] 出口速度过慢（≈%d KB/s），换下一个中继…", label, slow.bps/1024))
+					stageMsg(fmt.Sprintf("[%s] 出口速度偏慢（≈%d KB/s），换下一个中继…", label, slow.bps/1024))
 					if slowRejects >= openvpnSpeedRetries {
 						opts.openvpnAcceptSlow = true
 						stageMsg(fmt.Sprintf("[%s] 已连续 %d 个中继偏慢，后续优先保持连接、不再因速度换节点", label, slowRejects))
@@ -790,44 +917,50 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 				}
 			}
 			if serr == nil {
-				clearVPNGateFailure(node.id())
-				rememberLastGoodVPNGate(node)
-				if err := saveState(state); err != nil {
-					fmt.Fprintln(os.Stderr, errPal.warn("state not persisted: "+err.Error()))
-				}
-				stageMsg(fmt.Sprintf("[%s] 连接成功（出口 = VPN Gate %s）", label, node.CountryShort))
-				// Say it out loud when the session landed somewhere else: the
-				// region is a preference, so a fallback is legitimate — but a
-				// silent one looks like the selector is broken.
-				if opts.openvpnRegion != "" && !strings.EqualFold(node.CountryShort, opts.openvpnRegion) {
-					stageMsg(fmt.Sprintf("[%s] 注意：所选地区 %s 的节点都没连上，本次已改用 %s",
-						label, opts.openvpnRegion, node.CountryShort))
-				}
-				fmt.Fprintln(os.Stderr, errPal.ok(state.statusLine()))
-				if opts.tunMode {
-					fmt.Fprintln(os.Stderr, errPal.warn("TUN mode requires running with administrator rights"))
-				}
-				if !opts.noGuard {
-					ensureSessionGuard(state)
-				}
-				return nil
+				return finishOpenVPN(state, node)
 			}
 			lastErr = serr
 			fmt.Fprintln(os.Stderr, errPal.warn(fmt.Sprintf("组合 %s + %s: %v", ce.Endpoint, node.id(), serr)))
 			// Deliberately NOT markEndpointDead: a relay failure says nothing
 			// about the WARP underlay, and evicting a healthy endpoint here would
 			// poison the scan cache for every later session.
-			if serr != nil && strings.Contains(serr.Error(), "base endpoint") {
-				// A dead underlay fails every relay; move on to the next base
-				// instead of burning the remaining combinations on it.
+			rotateBase, clearRelays, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
+			for _, id := range clearRelays {
+				clearVPNGateFailure(id)
+			}
+			if markFailed {
+				// The relay itself failed; the phone client's 10-minute memory keeps
+				// the next attempt (or the automatic retry scan) off this node.
+				markVPNGateFailed(node.id())
+			}
+			if rotateBase {
+				// A dead or DPI-dropped underlay fails every relay; move on to
+				// the next base endpoint instead of burning the remaining
+				// combinations on this one. Because relayIdx keeps advancing,
+				// the next base also tries fresh relays instead of repeating
+				// potentially dead relays[0..1].
+				stageMsg(fmt.Sprintf("[%s] 基础端点 %s 连续 %d 次中继握手超时，切换下一个基础端点…",
+					label, ce.Endpoint, baseTrack.timeouts))
 				break
 			}
-			// The relay itself failed; the phone client's 10-minute memory keeps
-			// the next attempt (or the automatic retry scan) off this node.
-			markVPNGateFailed(node.id())
 		}
 		if tried >= openvpnMaxAttempts {
 			break
+		}
+	}
+	// If we already verified a working (just below-threshold) relay earlier in
+	// this connect and all subsequent candidates failed, fall back to the
+	// fastest verified relay instead of leaving the user disconnected.
+	if bestSlowNode != nil && ctx.Err() == nil {
+		stageMsg(fmt.Sprintf("[%s] 其余候选均未连上，回退保留已验证可用的中继 %s（≈%d KB/s）…",
+			label, bestSlowNode.id(), bestSlowBps/1024))
+		fbOpts := opts
+		fbOpts.openvpnNode = bestSlowNode
+		fbOpts.openvpnAcceptSlow = true
+		if state, serr := startAndVerify(ctx, fbOpts, bestSlowBase, run, bin, cDir, label, nil); serr == nil {
+			return finishOpenVPN(state, *bestSlowNode)
+		} else if ctx.Err() != nil {
+			return ctx.Err()
 		}
 	}
 	// Every combination failed: the snapshot may be stale on both axes. One
@@ -888,7 +1021,7 @@ func warmupOpenVPN(ctx context.Context, mixedPort int, label string) error {
 	if lastErr == nil {
 		lastErr = fmt.Errorf("没有请求完成")
 	}
-	return fmt.Errorf("OpenVPN 中继握手超时（%s 内未建链）: %w", openvpnWarmupWindow, lastErr)
+	return &openvpnHandshakeTimeoutError{window: openvpnWarmupWindow, err: lastErr}
 }
 
 // watchOpenVPNLogs follows mihomo's log stream and reports a terminal relay

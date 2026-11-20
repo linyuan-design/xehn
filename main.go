@@ -548,6 +548,80 @@ func runScan(ctx context.Context, opts options, run protoRun, ips []netip.Addr, 
 	if !run.isMASQUE() {
 		ports = warpPorts
 	}
+	results, err := runPhase2(ctx, opts, run, ips, ports, timeout, emit)
+	if err != nil {
+		return phaseResult{}, err
+	}
+	// Phase 1 stops on the first IP that answers any port: if that IP only
+	// answered a DPI-dropped port (commonly UDP 2408) or timeout_sec was too
+	// tight for the full in-tunnel HTTPS meta round-trip, retry once with the
+	// remaining primary ports (putting 500/1701/4500 ahead of 2408) and at
+	// least 4s per-probe budget before declaring 0 working endpoints.
+	if retryPorts, retryTimeout, reason, ok := phase2FallbackPlan(run, opts, ports, timeout, results); ok && ctx.Err() == nil {
+		if reason == "missing_primary_ports" {
+			stageMsg(fmt.Sprintf("[%s] 端口 %v 数据面未通过，补扫其余主端口 %v（超时 %ds）…",
+				protoLabel(run.name), ports, retryPorts, int(retryTimeout.Seconds())))
+		} else {
+			stageMsg(fmt.Sprintf("[%s] %ds 超时下无可用端点，放宽至 %ds 重试主端口 %v…",
+				protoLabel(run.name), int(timeout.Seconds()), int(retryTimeout.Seconds()), retryPorts))
+		}
+		warpPorts = retryPorts
+		retryResults, rerr := runPhase2(ctx, opts, run, ips, retryPorts, retryTimeout, emit)
+		if rerr != nil {
+			return phaseResult{}, rerr
+		}
+		results = retryResults
+	}
+
+	emit(doneMsg{})
+	return phaseResult{run, results}, nil
+}
+
+const scanRetryMinTimeout = 4 * time.Second
+
+// fallbackPrimaryWarpPorts prefers alternate primary UDP ports ahead of 2408,
+// which is the default WARP port most frequently targeted by ISP QoS/DPI.
+var fallbackPrimaryWarpPorts = []int{500, 1701, 4500, 2408}
+
+// missingPrimaryPorts returns the primary WARP ports that were not already
+// covered by used, ordered with 500/1701/4500 ahead of 2408.
+func missingPrimaryPorts(used []int) []int {
+	seen := make(map[int]bool, len(used))
+	for _, p := range used {
+		seen[p] = true
+	}
+	var out []int
+	for _, p := range fallbackPrimaryWarpPorts {
+		if !seen[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// phase2FallbackPlan decides whether an empty Phase 2 sweep warrants one
+// fallback pass over missing primary ports or a wider per-probe timeout.
+func phase2FallbackPlan(run protoRun, opts options, usedPorts []int, timeout time.Duration, results []endpointResult) (ports []int, retryTimeout time.Duration, reason string, ok bool) {
+	if run.isMASQUE() || opts.port != 0 || opts.sweepPorts == sweepAll {
+		return nil, 0, "", false
+	}
+	if len(workingSorted(results)) > 0 {
+		return nil, 0, "", false
+	}
+	retryTimeout = timeout
+	if retryTimeout < scanRetryMinTimeout {
+		retryTimeout = scanRetryMinTimeout
+	}
+	if missing := missingPrimaryPorts(usedPorts); len(missing) > 0 {
+		return missing, retryTimeout, "missing_primary_ports", true
+	}
+	if timeout < scanRetryMinTimeout {
+		return append([]int(nil), fallbackPrimaryWarpPorts...), retryTimeout, "tight_timeout", true
+	}
+	return nil, 0, "", false
+}
+
+func runPhase2(ctx context.Context, opts options, run protoRun, ips []netip.Addr, ports []int, timeout time.Duration, emit emitter) ([]endpointResult, error) {
 	targets := probeTargets(run, opts.sweepPorts != "", ips, ports)
 	results := make([]endpointResult, len(targets))
 	pings := opts.tunPingCount
@@ -594,10 +668,8 @@ func runScan(ctx context.Context, opts options, run protoRun, ips []netip.Addr, 
 	}
 	if err := runTunnelPool(opts.tunnelParallel, run, len(targets), work); err != nil {
 		emit(stepMsg{fail: true, summary: err.Error()})
-		return phaseResult{}, err
+		return nil, err
 	}
 	emit(barEndMsg{label: label, summary: "done"})
-
-	emit(doneMsg{})
-	return phaseResult{run, results}, nil
+	return results, nil
 }

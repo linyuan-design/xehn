@@ -623,10 +623,13 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 		return clientState{}, false
 	}
 
-	const maxAttempts = 4
+	const maxAttempts = 6
 	attempts := 0
-	for _, ce := range bases {
-		for i := range relays {
+	relayIdx := 0
+	for baseIdx, ce := range bases {
+		var baseTrack openvpnBaseTracker
+		hasMoreBases := baseIdx < len(bases)-1
+		for step := 0; step < len(relays); step++ {
 			if attempts >= maxAttempts || ctx.Err() != nil {
 				return clientState{}, false
 			}
@@ -635,7 +638,8 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 				return clientState{}, false
 			}
 			attempts++
-			node := relays[i]
+			node := relays[relayIdx%len(relays)]
+			relayIdx++
 			opts.openvpnNode = &node
 			logf(fmt.Sprintf("切换出口 %s（%s），基础端点 %s（第 %d/%d 次）…",
 				node.id(), node.CountryShort, ce.Endpoint, attempts, maxAttempts))
@@ -646,10 +650,19 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 			}
 			state, serr := startAndVerify(ctx, opts, ce, run, bin, cDir, "OpenVPN", nil)
 			if serr != nil {
-				if !strings.Contains(serr.Error(), "base endpoint") {
+				rotateBase, clearRelays, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
+				for _, id := range clearRelays {
+					clearVPNGateFailure(id)
+				}
+				if markFailed {
 					markVPNGateFailed(node.id())
 				}
 				logf(fmt.Sprintf("出口 %s 修复失败: %v", node.id(), serr))
+				if rotateBase {
+					logf(fmt.Sprintf("基础端点 %s 连续 %d 次中继握手超时，切换下一个基础端点…",
+						ce.Endpoint, baseTrack.timeouts))
+					break
+				}
 				continue
 			}
 			clearVPNGateFailure(node.id())
