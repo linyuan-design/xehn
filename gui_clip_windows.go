@@ -15,9 +15,9 @@ import (
 func (u *natUI) clipCanvas(c *walk.Canvas, r walk.Rectangle, fn func()) {
 	hdc := c.HDC()
 	saved := win.SaveDC(hdc)
+	defer win.RestoreDC(hdc, saved)
 	win.IntersectClipRect(hdc, int32(r.X), int32(r.Y), int32(r.X+r.Width), int32(r.Y+r.Height))
 	fn()
-	win.RestoreDC(hdc, saved)
 }
 
 // clipSpots trims every spot registered since start to the painted band and

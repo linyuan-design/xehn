@@ -984,7 +984,7 @@ func (u *natUI) spinLoop() {
 		case <-t.C:
 		}
 		u.sync(func() {
-			if u.m.connecting {
+			if u.m.connecting && u.mw.Visible() && u.m.page == pageHome {
 				u.m.spin++
 				u.invalidate()
 			}
@@ -2119,6 +2119,11 @@ func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
 			err = nil
 		}
 	}()
+	// The buffered canvas borrows the paint HDC (doNotDispose == true).
+	// Dispose releases its lazily created text-measurement Enhanced Metafile DC
+	// without closing the underlying HDC needed by Walk's BitBlt.
+	defer c.Dispose()
+
 	b := u.mw.ClientBoundsPixels()
 	pxW := b.Width
 	if pxW < 10 {
@@ -2158,7 +2163,12 @@ func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
 	u.scaleFonts(u.k * 96.0 / float64(dpi))
 	u.sp = u.sp[:0]
 
-	if err := c.FillRectanglePixels(u.brush(th.window), walk.Rectangle{X: 0, Y: 0, Width: b.Width, Height: b.Height}); err != nil {
+	bg := u.brush(th.window)
+	if bg == nil {
+		return fmt.Errorf("create background brush failed")
+	}
+	defer bg.Dispose()
+	if err := c.FillRectanglePixels(bg, walk.Rectangle{X: 0, Y: 0, Width: b.Width, Height: b.Height}); err != nil {
 		return err
 	}
 	u.paintWallpaper(c, b.Width, b.Height)
@@ -2397,8 +2407,11 @@ func (u *natUI) drawFlag(c *walk.Canvas, x, y, w, h float64, cc string) {
 	}
 	disc := func(col walk.Color, dx, dy, dw, dh float64) {
 		b := u.brush(col)
+		if b == nil {
+			return
+		}
+		defer b.Dispose()
 		_ = c.FillEllipsePixels(b, u.r(x+dx*w, y+dy*h, dw*w, dh*h))
-		b.Dispose()
 	}
 	star := func(col walk.Color, fx float64) {
 		u.textC(c, "★", u.f.f8, col, u.r(x+fx*w, y+2, w*0.45, h-4))
