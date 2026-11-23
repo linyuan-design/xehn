@@ -78,11 +78,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $argsList = @('-SkipBuild', '-Version', $env:BUILD_VER)
-          if ($env:MIHOMO_PATH -and (Test-Path $env:MIHOMO_PATH)) {
-            $argsList += @('-MihomoPath', $env:MIHOMO_PATH)
+          $packArgs = @{
+            SkipBuild = $true
+            Version   = $env:BUILD_VER
           }
-          & .\pack.ps1 @argsList
+          if ($env:MIHOMO_PATH -and (Test-Path $env:MIHOMO_PATH)) {
+            $packArgs.MihomoPath = $env:MIHOMO_PATH
+          }
+          & .\pack.ps1 @packArgs
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
