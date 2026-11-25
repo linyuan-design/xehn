@@ -61,11 +61,39 @@ func TestMergeVPNGateNodesPreservesRareCountriesAndUpdatesFresh(t *testing.T) {
 	if _, ok := byID["us-198.51.100.10-443"]; !ok {
 		t.Fatal("unexpired US relay from previous slice was dropped")
 	}
+	if !byID["us-198.51.100.10-443"].Stale {
+		t.Fatal("carried-over US relay must be marked Stale=true")
+	}
 	if _, ok := byID["de-198.51.100.11-443"]; ok {
 		t.Fatal("expired DE relay should have been pruned")
 	}
-	if jp := byID["jp-198.51.100.12-443"]; jp.Profile != "new" || jp.Sessions != 5 {
-		t.Fatalf("fresh relay did not overwrite stale entry: %+v", jp)
+	if jp := byID["jp-198.51.100.12-443"]; jp.Profile != "new" || jp.Sessions != 5 || jp.Stale {
+		t.Fatalf("fresh relay did not overwrite stale entry cleanly: %+v", jp)
+	}
+	if byID["kr-198.51.100.13-995"].Stale {
+		t.Fatal("fresh KR relay must have Stale=false")
+	}
+}
+
+func TestLiveRelaysOutrankStaleMergedAndUDPRelays(t *testing.T) {
+	nodes := []vpnGateNode{
+		// Offline historical relay with high earlier MeasuredBps must NOT beat live relays
+		{CountryShort: "TH", IP: "27.130.213.241", Port: 1479, Proto: "tcp", Class: "residential", Speed: 500_000_000, Sessions: 5, PingMS: 20, MeasuredBps: 230 * 1024, Stale: true},
+		// Live UDP relay with higher reported speed must rank behind live TCP relay
+		{CountryShort: "TH", IP: "183.88.45.88", Port: 1915, Proto: "udp", Class: "residential", Speed: 600_000_000, Sessions: 4, PingMS: 15, Stale: false},
+		// Live TCP relay
+		{CountryShort: "KR", IP: "14.53.242.238", Port: 995, Proto: "tcp", Class: "residential", Speed: 250_000_000, Sessions: 8, PingMS: 35, Stale: false},
+	}
+	sortVPNGateNodesByLatency(nodes)
+
+	if nodes[0].IP != "14.53.242.238" {
+		t.Fatalf("expected live TCP relay first, got %s (proto=%s stale=%v)", nodes[0].IP, nodes[0].Proto, nodes[0].Stale)
+	}
+	if nodes[1].IP != "183.88.45.88" {
+		t.Fatalf("expected live UDP relay second (ahead of stale), got %s", nodes[1].IP)
+	}
+	if nodes[2].IP != "27.130.213.241" || !nodes[2].Stale {
+		t.Fatalf("expected stale historical relay last, got %+v", nodes[2])
 	}
 }
 

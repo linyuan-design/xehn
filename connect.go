@@ -65,15 +65,13 @@ const (
 	// a healthy-but-slow endpoint.
 	verifyRetryDelay = 2 * time.Second
 	// openvpnMaxAttempts caps base-endpoint × relay combinations in one connect.
-	// A VPN Gate relay that cannot handshake is common; the candidates arrive
-	// already ordered (residential block first, then the datacenter fleet), so six
-	// attempts give the failover chain room without turning one connect into a
-	// multi-minute walk through dead nodes.
-	openvpnMaxAttempts = 8
+	// Five attempts (~15s warmup ceiling each) give base rotation + relay
+	// failover room without turning one connect into a multi-minute walk.
+	openvpnMaxAttempts = 5
 	// openvpnMaxTimeoutsPerBase caps consecutive OpenVPN handshake timeouts on
 	// an unconfirmed WARP base endpoint before rotating to the next base
 	// candidate. Without this, one dead or DPI-dropped underlay (e.g. UDP 2408)
-	// burns the whole attempt budget on cands[0] and blacklists healthy relays.
+	// burns the whole attempt budget on cands[0].
 	openvpnMaxTimeoutsPerBase = 2
 	// openvpnWarmupWindow is how long one relay gets to complete its OpenVPN
 	// handshake. mihomo detaches the handshake from the inbound dial (see
@@ -103,6 +101,10 @@ const (
 	// exits while still skipping genuinely stalled ones.
 	openvpnMinBps       = 150 * 1024
 	openvpnSpeedRetries = 1
+	// openvpnSpeedGateDeadline bounds how long an interactive connect may shop
+	// for speed: once elapsed connect time reaches this budget, any verified
+	// working relay is accepted immediately instead of risking more timeouts.
+	openvpnSpeedGateDeadline = 45 * time.Second
 )
 
 // slowRelayError marks a relay that passed every data-plane check but measured
@@ -133,9 +135,8 @@ func (e *openvpnHandshakeTimeoutError) Unwrap() error { return e.err }
 // endpoint should continue trying other relays on the same underlay or rotate
 // to the next base endpoint.
 type openvpnBaseTracker struct {
-	confirmed     bool
-	timeouts      int
-	suspectRelays []string
+	confirmed bool
+	timeouts  int
 }
 
 func isOpenVPNBaseConfirmedErr(err error) bool {
@@ -163,36 +164,34 @@ func isOpenVPNBaseSuspectErr(err error) bool {
 
 // record classifies one failed relay attempt on the current base endpoint.
 // rotateBase is true when the loop should move to the next base endpoint;
-// clearRelays returns relay IDs that were tentatively marked failed on this
-// suspected-dead base and should be un-blacklisted; markFailed indicates
-// whether relayID should be recorded in the failure memory.
-func (tr *openvpnBaseTracker) record(relayID string, err error, hasMoreBases bool) (rotateBase bool, clearRelays []string, markFailed bool) {
+// markFailed indicates whether relayID should be recorded in the 10-minute
+// failure memory. Timed-out relays are ALWAYS kept in the failure memory even
+// when rotating bases: on VPN Gate, consecutive offline volunteer relays are
+// common, and un-blacklisting them made reconnects re-test the same dead nodes
+// for minutes (if every candidate eventually fails, freshVPNGateNodes clears
+// the memory automatically).
+func (tr *openvpnBaseTracker) record(relayID string, err error, hasMoreBases bool) (rotateBase bool, markFailed bool) {
+	_ = relayID
 	if isOpenVPNBaseConfirmedErr(err) {
 		tr.confirmed = true
 		tr.timeouts = 0
-		tr.suspectRelays = nil
 		var slow *slowRelayError
 		if errors.As(err, &slow) {
-			return false, nil, false
+			return false, false
 		}
-		return false, nil, true
+		return false, true
 	}
 	if err != nil && strings.Contains(err.Error(), "base endpoint") {
-		clear := append([]string(nil), tr.suspectRelays...)
-		tr.suspectRelays = nil
-		return hasMoreBases, clear, false
+		return hasMoreBases, false
 	}
 	if isOpenVPNBaseSuspectErr(err) && !tr.confirmed && hasMoreBases {
 		tr.timeouts++
 		if tr.timeouts >= openvpnMaxTimeoutsPerBase {
-			clear := append([]string(nil), tr.suspectRelays...)
-			tr.suspectRelays = nil
-			return true, clear, false
+			return true, true
 		}
-		tr.suspectRelays = append(tr.suspectRelays, relayID)
-		return false, nil, true
+		return false, true
 	}
-	return false, nil, true
+	return false, true
 }
 
 // proxyHelperAllowed gates the UAC elevation fallback: only the windowsgui
@@ -746,6 +745,7 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	// An interactive connect shops for a usable exit; the health repair builds
 	// its own options and deliberately leaves this off.
 	opts.openvpnSpeedGate = true
+	startedAt := time.Now()
 
 	label := protoLabel(opts.proto) + "+OpenVPN"
 	stageMsg(fmt.Sprintf("[%s] 开始连接：先起基础协议，再经 VPN Gate 节点出站…", label))
@@ -894,6 +894,11 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			node := relays[relayIdx%len(relays)]
 			relayIdx++
 			opts.openvpnNode = &node
+			if !opts.openvpnAcceptSlow && time.Since(startedAt) >= openvpnSpeedGateDeadline {
+				opts.openvpnAcceptSlow = true
+				stageMsg(fmt.Sprintf("[%s] 连接已耗时 %ds，后续可用中继将直接放行不再挑剔测速",
+					label, int(time.Since(startedAt).Seconds())))
+			}
 			stageMsg(fmt.Sprintf("[%s] 基础端点 %s + 出口节点 %s（%s，组合 %d/%d）…",
 				label, ce.Endpoint, node.id(), node.CountryShort, tried, min(openvpnMaxAttempts, len(cands)*len(relays))))
 			state, serr := startAndVerify(ctx, opts, ce, run, bin, cDir, label, nil)
@@ -932,10 +937,7 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			// Deliberately NOT markEndpointDead: a relay failure says nothing
 			// about the WARP underlay, and evicting a healthy endpoint here would
 			// poison the scan cache for every later session.
-			rotateBase, clearRelays, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
-			for _, id := range clearRelays {
-				clearVPNGateFailure(id)
-			}
+			rotateBase, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
 			if markFailed {
 				// The relay itself failed; the phone client's 10-minute memory keeps
 				// the next attempt (or the automatic retry scan) off this node.
@@ -976,6 +978,7 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	if opts.pick == "" && !opts.scanNow {
 		stageMsg(fmt.Sprintf("[%s] 全部组合失败，重新扫描基础端点并刷新 VPN Gate 节点…", label))
 		opts.scanNow = true
+		opts.openvpnAcceptSlow = true
 		return runConnectOpenVPN(ctx, opts)
 	}
 	return fmt.Errorf("connect failed: OpenVPN 出口在 %d 个组合上均未通过验证: %w", tried, lastErr)

@@ -12,49 +12,55 @@ import (
 )
 
 func TestOpenVPNBaseTrackerRotatesOnConsecutiveTimeouts(t *testing.T) {
-	timeoutErr := &openvpnHandshakeTimeoutError{window: 22 * time.Second, err: errors.New("deadline exceeded")}
+	timeoutErr := &openvpnHandshakeTimeoutError{window: 15 * time.Second, err: errors.New("deadline exceeded")}
 
 	var tr openvpnBaseTracker
-	rot, clr, mark := tr.record("kr-1.1.1.1-995", timeoutErr, true)
-	if rot || len(clr) != 0 || !mark {
-		t.Fatalf("1st timeout: got rot=%v clr=%v mark=%v, want false [] true", rot, clr, mark)
+	rot, mark := tr.record("kr-1.1.1.1-995", timeoutErr, true)
+	if rot || !mark {
+		t.Fatalf("1st timeout: got rot=%v mark=%v, want false true", rot, mark)
 	}
-	rot, clr, mark = tr.record("kr-2.2.2.2-995", timeoutErr, true)
-	if !rot || !reflect.DeepEqual(clr, []string{"kr-1.1.1.1-995"}) || mark {
-		t.Fatalf("2nd timeout: got rot=%v clr=%v mark=%v, want true [kr-1.1.1.1-995] false", rot, clr, mark)
+	rot, mark = tr.record("kr-2.2.2.2-995", timeoutErr, true)
+	if !rot || !mark {
+		t.Fatalf("2nd timeout: got rot=%v mark=%v, want true true (timed-out relays stay in failure memory)", rot, mark)
+	}
+
+	var trBaseErr openvpnBaseTracker
+	rot, mark = trBaseErr.record("kr-3.3.3.3-995", errors.New("base endpoint dial failed"), true)
+	if !rot || mark {
+		t.Fatalf("explicit base endpoint error: got rot=%v mark=%v, want true false", rot, mark)
 	}
 }
 
 func TestOpenVPNBaseTrackerStaysWhenBaseConfirmed(t *testing.T) {
-	timeoutErr := &openvpnHandshakeTimeoutError{window: 22 * time.Second, err: errors.New("deadline exceeded")}
+	timeoutErr := &openvpnHandshakeTimeoutError{window: 15 * time.Second, err: errors.New("deadline exceeded")}
 	authErr := errors.New("OpenVPN 出口认证被拒绝（AUTH_FAILED），立即换节点")
 
 	var tr openvpnBaseTracker
-	rot, clr, mark := tr.record("jp-1.1.1.1-443", authErr, true)
-	if rot || len(clr) != 0 || !mark || !tr.confirmed {
-		t.Fatalf("AUTH_FAILED should confirm base and mark relay failed: rot=%v clr=%v mark=%v confirmed=%v", rot, clr, mark, tr.confirmed)
+	rot, mark := tr.record("jp-1.1.1.1-443", authErr, true)
+	if rot || !mark || !tr.confirmed {
+		t.Fatalf("AUTH_FAILED should confirm base and mark relay failed: rot=%v mark=%v confirmed=%v", rot, mark, tr.confirmed)
 	}
 	for i, id := range []string{"jp-2.2.2.2-443", "jp-3.3.3.3-443", "jp-4.4.4.4-443"} {
-		rot, clr, mark = tr.record(id, timeoutErr, true)
-		if rot || len(clr) != 0 || !mark {
-			t.Fatalf("timeout #%d on confirmed base: got rot=%v clr=%v mark=%v, want false [] true", i+1, rot, clr, mark)
+		rot, mark = tr.record(id, timeoutErr, true)
+		if rot || !mark {
+			t.Fatalf("timeout #%d on confirmed base: got rot=%v mark=%v, want false true", i+1, rot, mark)
 		}
 	}
 
 	var trSlow openvpnBaseTracker
-	rot, clr, mark = trSlow.record("kr-9.9.9.9-443", &slowRelayError{bps: 100 * 1024}, true)
-	if rot || len(clr) != 0 || mark || !trSlow.confirmed {
-		t.Fatalf("slowRelayError should confirm base without blacklisting: rot=%v clr=%v mark=%v confirmed=%v", rot, clr, mark, trSlow.confirmed)
+	rot, mark = trSlow.record("kr-9.9.9.9-443", &slowRelayError{bps: 100 * 1024}, true)
+	if rot || mark || !trSlow.confirmed {
+		t.Fatalf("slowRelayError should confirm base without blacklisting: rot=%v mark=%v confirmed=%v", rot, mark, trSlow.confirmed)
 	}
 }
 
 func TestOpenVPNBaseTrackerDoesNotRotateWhenLastBase(t *testing.T) {
-	timeoutErr := &openvpnHandshakeTimeoutError{window: 22 * time.Second, err: errors.New("deadline exceeded")}
+	timeoutErr := &openvpnHandshakeTimeoutError{window: 15 * time.Second, err: errors.New("deadline exceeded")}
 	var tr openvpnBaseTracker
 	for _, id := range []string{"kr-1-995", "kr-2-995", "kr-3-995"} {
-		rot, clr, mark := tr.record(id, timeoutErr, false)
-		if rot || len(clr) != 0 || !mark {
-			t.Fatalf("single base must not rotate: got rot=%v clr=%v mark=%v", rot, clr, mark)
+		rot, mark := tr.record(id, timeoutErr, false)
+		if rot || !mark {
+			t.Fatalf("single base must not rotate: got rot=%v mark=%v", rot, mark)
 		}
 	}
 }

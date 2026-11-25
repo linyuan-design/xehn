@@ -810,7 +810,8 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, coreLog io.Writer, l
 		return clientState{}, false
 	}
 
-	const maxAttempts = 6
+	const maxAttempts = 4
+	repairStartedAt := time.Now()
 	attempts := 0
 	slowRejects := 0
 	relayIdx := 0
@@ -848,6 +849,9 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, coreLog io.Writer, l
 			node := relays[relayIdx%len(relays)]
 			relayIdx++
 			opts.openvpnNode = &node
+			if !opts.openvpnAcceptSlow && time.Since(repairStartedAt) >= 30*time.Second {
+				opts.openvpnAcceptSlow = true
+			}
 			logf(fmt.Sprintf("切换出口 %s（%s），基础端点 %s（第 %d/%d 次）…",
 				node.id(), node.CountryShort, ce.Endpoint, attempts, maxAttempts))
 			if prev, serr := loadState(); serr == nil {
@@ -873,10 +877,7 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, coreLog io.Writer, l
 					}
 					continue
 				}
-				rotateBase, clearRelays, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
-				for _, id := range clearRelays {
-					clearVPNGateFailure(id)
-				}
+				rotateBase, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
 				if markFailed {
 					markVPNGateFailed(node.id())
 				}

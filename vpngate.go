@@ -35,15 +35,15 @@ const (
 	// being present (same role as the Android client's last-endpoint.json).
 	vpnGateUnderlayName = "vpngate-underlay.json"
 	// vpnGateCacheTTL is how long a fetched list is served before a refresh.
-	// VPN Gate nodes churn fast, but re-fetching on every dropdown open would
-	// hammer the API for a list that is only minutes stale.
-	vpnGateCacheTTL = 3 * time.Hour
+	// Volunteer VPN Gate PCs churn within tens of minutes, so 30 minutes avoids
+	// hammering the API on dropdown clicks while keeping connect candidates fresh.
+	vpnGateCacheTTL = 30 * time.Minute
 	// vpnGateMaxNodes caps the cached pool after merging recent slices.
 	vpnGateMaxNodes = 500
 	// vpnGateMergeTTL keeps nodes seen in earlier slices (especially rarer
-	// countries) across refreshes so a single truncated/rotated API slice does
-	// not wipe out previously discovered regions.
-	vpnGateMergeTTL = 6 * time.Hour
+	// countries) as low-priority fallbacks across refreshes, marked Stale so
+	// live-slice nodes are always tried first.
+	vpnGateMergeTTL = 2 * time.Hour
 	// vpnGateConnectNodes is the candidate cap handed to one connect, matching
 	// the phone client's OPENVPN_CANDIDATE_CAP. The attempt cap is smaller; the
 	// 10-minute failure memory moves later retries down this list.
@@ -99,6 +99,11 @@ type vpnGateNode struct {
 	Class   string    `json:"class"`
 	Profile string    `json:"profile"`
 	SeenAt  time.Time `json:"seen_at,omitempty"`
+	// Stale marks a relay carried over from an earlier VPN Gate slice that was
+	// absent from the latest fetch. Kept as a fallback for rare regions, but
+	// always ranked behind live-slice relays so offline volunteer PCs are never
+	// tried first.
+	Stale bool `json:"stale,omitempty"`
 	// LatencyMS is measured locally (through the WARP underlay when the list
 	// itself had to be fetched that way); never persisted.
 	LatencyMS int64 `json:"-"`
@@ -509,6 +514,13 @@ func loadVPNGateCache() ([]vpnGateNode, time.Time) {
 	if json.Unmarshal(raw, &f) != nil {
 		return nil, time.Time{}
 	}
+	if !f.At.IsZero() {
+		for i := range f.Nodes {
+			if !f.Nodes[i].SeenAt.IsZero() && f.At.Sub(f.Nodes[i].SeenAt) > time.Minute {
+				f.Nodes[i].Stale = true
+			}
+		}
+	}
 	return f.Nodes, f.At
 }
 
@@ -526,8 +538,8 @@ func saveVPNGateCache(nodes []vpnGateNode) {
 
 // mergeVPNGateNodes combines a newly fetched slice with unexpired nodes from
 // earlier slices. Fresh entries always win (updating live session/speed stats);
-// earlier entries survive up to vpnGateMergeTTL so rare countries or throttled
-// API responses do not wipe out the pool.
+// earlier entries survive up to vpnGateMergeTTL marked Stale so rare countries
+// remain selectable while live relays are always tried first.
 func mergeVPNGateNodes(existing, fresh []vpnGateNode, fallbackAt, now time.Time) []vpnGateNode {
 	merged := make([]vpnGateNode, 0, len(fresh)+len(existing))
 	seen := make(map[string]bool, len(fresh)+len(existing))
@@ -538,6 +550,7 @@ func mergeVPNGateNodes(existing, fresh []vpnGateNode, fallbackAt, now time.Time)
 		}
 		seen[id] = true
 		n.SeenAt = now
+		n.Stale = false
 		merged = append(merged, n)
 	}
 	var kept []vpnGateNode
@@ -555,6 +568,7 @@ func mergeVPNGateNodes(existing, fresh []vpnGateNode, fallbackAt, now time.Time)
 		}
 		seen[id] = true
 		n.SeenAt = at
+		n.Stale = true
 		kept = append(kept, n)
 	}
 	// Prefer the freshest kept entries if the combined pool exceeds the cap.
@@ -986,6 +1000,9 @@ func parseVPNGateCSV(raw []byte) []vpnGateNode {
 func sortVPNGateNodes(nodes []vpnGateNode) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		a, b := nodes[i], nodes[j]
+		if a.Stale != b.Stale {
+			return !a.Stale
+		}
 		if (a.Proto == "tcp") != (b.Proto == "tcp") {
 			return a.Proto == "tcp"
 		}
@@ -1503,6 +1520,11 @@ func preferLastGoodVPNGate(relays []vpnGateNode, pin, region string) []vpnGateNo
 		if n.id() != last.ID {
 			continue
 		}
+		// Never promote a relay that vanished from the latest VPN Gate slice
+		// ahead of relays confirmed online right now.
+		if n.Stale {
+			return relays
+		}
 		// "Last good" only remembers that a relay carried traffic, not that it
 		// was fast. A node measured below the floor must not be promoted over
 		// untested relays: that is exactly how the slow node stayed sticky.
@@ -1605,8 +1627,14 @@ func vpnGateQualityScore(n vpnGateNode) int64 {
 func sortVPNGateNodesByLatency(nodes []vpnGateNode) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		a, b := nodes[i], nodes[j]
+		if a.Stale != b.Stale {
+			return !a.Stale
+		}
 		if ra, rb := a.classRank(), b.classRank(); ra != rb {
 			return ra < rb
+		}
+		if (a.Proto == "tcp") != (b.Proto == "tcp") {
+			return a.Proto == "tcp"
 		}
 		at, bt := vpnGateSpeedTier(a.MeasuredBps), vpnGateSpeedTier(b.MeasuredBps)
 		if at != bt {
@@ -1631,9 +1659,6 @@ func sortVPNGateNodesByLatency(nodes []vpnGateNode) {
 			if ap > 0 && bp > 0 && ap != bp {
 				return ap < bp
 			}
-		}
-		if (a.Proto == "tcp") != (b.Proto == "tcp") {
-			return a.Proto == "tcp"
 		}
 		if a.Score != b.Score {
 			return a.Score > b.Score

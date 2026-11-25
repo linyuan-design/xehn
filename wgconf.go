@@ -398,7 +398,7 @@ const (
 	// from the inbound dial timeout, so a slow public relay still completes the
 	// handshake while the first client request has already given up; the
 	// connect flow warms the tunnel with retries inside this window.
-	openvpnHandshakeTimeout = 20
+	openvpnHandshakeTimeout = 13
 	// psiphonUnderlayPortGap is the offset of the dedicated SOCKS inbound that
 	// exists only for Psiphon's own dials. Routing that inbound to the base
 	// protocol — instead of relying on process detection — is what makes the
