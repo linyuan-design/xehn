@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"testing"
 	"time"
 )
@@ -84,3 +85,14 @@ func TestHealthMonitorNeverInterruptsActiveUserDownload(t *testing.T) {
 		}
 	}
 }
+
+func TestActivateSessionGuardClaimsInProcessForGUI(t *testing.T) {
+	t.Setenv("WARP_CLIENT_HOME", t.TempDir())
+	activateSessionGuard(options{coreLog: io.Discard}, clientState{Connected: true, MixedPort: 7890})
+	owner, alive := currentHealthOwner()
+	if !alive || owner <= 0 {
+		t.Fatalf("expected GUI process to claim health owner directly, got pid=%d alive=%v", owner, alive)
+	}
+	releaseHealthOwner(owner)
+}
+

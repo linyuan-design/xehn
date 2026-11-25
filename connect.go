@@ -30,6 +30,20 @@ func stageMsg(s string) {
 	}
 }
 
+// activateSessionGuard hands health monitoring to the GUI window directly when
+// running inside the GUI (opts.coreLog != nil), or spawns the detached guard
+// process for CLI connects whose parent process is about to exit.
+func activateSessionGuard(opts options, state clientState) {
+	if opts.noGuard {
+		return
+	}
+	if opts.coreLog != nil {
+		_ = claimHealthOwner(os.Getpid())
+		return
+	}
+	ensureSessionGuard(state)
+}
+
 const (
 	// connectMaxAttempts caps how many cached endpoints one connect tries in
 	// best-first order before falling back to a fresh scan. Five, because on
@@ -503,9 +517,7 @@ func runConnectInner(ctx context.Context, opts options) error {
 			// takes ownership of its own sessions from its status loop.
 			// The settings page's "auto repair" switch is the one way out: with
 			// it off the session simply is not watched.
-			if !opts.noGuard {
-				ensureSessionGuard(state)
-			}
+			activateSessionGuard(opts, state)
 			return nil
 		}
 		lastErr = serr
@@ -688,9 +700,7 @@ func runConnectPsiphon(ctx context.Context, opts options) error {
 			// outlives this process and needs exactly one watcher. The guard is
 			// Psiphon-aware: it repairs a Psiphon session by restarting Psiphon,
 			// never by rotating the underlay (see psiphon_health.go).
-			if !opts.noGuard {
-				ensureSessionGuard(state)
-			}
+			activateSessionGuard(opts, state)
 			return nil
 		}
 		lastErr = serr
@@ -864,9 +874,7 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 		if opts.tunMode {
 			fmt.Fprintln(os.Stderr, errPal.warn("TUN mode requires running with administrator rights"))
 		}
-		if !opts.noGuard {
-			ensureSessionGuard(state)
-		}
+		activateSessionGuard(opts, state)
 		return nil
 	}
 	for baseIdx, ce := range cands {

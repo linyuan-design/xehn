@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -733,7 +734,7 @@ func repairOnce(ctx context.Context, opts options, dead string, tried map[string
 // Base endpoints are never marked dead here: a relay that cannot handshake says
 // nothing about the tunnel underneath it, and evicting healthy WARP endpoints
 // on a VPN Gate outage would poison the scan cache.
-func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (clientState, bool) {
+func repairOpenVPNOnce(ctx context.Context, st clientState, coreLog io.Writer, logf func(string)) (clientState, bool) {
 	cDir, err := coreDir()
 	if err != nil {
 		logf(fmt.Sprintf("修复失败：无法定位核心目录：%v", err))
@@ -742,6 +743,7 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 	opts := optionsFromState(st)
 	opts.openvpnNode = nil
 	opts.openvpnSpeedGate = true
+	opts.coreLog = coreLog
 	bin, err := core.EnsureBinary(cDir, opts.corePath)
 	if err != nil {
 		logf(fmt.Sprintf("修复失败：核心不可用：%v", err))
@@ -1075,7 +1077,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 				return nil
 			}
 			logf("OpenVPN 出口失效或半死卡顿：更换 VPN Gate 节点并重建会话…")
-			if _, ok := repairOpenVPNOnce(ctx, st, logf); ok {
+			if _, ok := repairOpenVPNOnce(ctx, st, nil, logf); ok {
 				mon.reset(time.Now())
 				continue
 			}

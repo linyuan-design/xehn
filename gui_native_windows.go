@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -278,6 +277,62 @@ type natUI struct {
 	// stale connected:false snapshot last, and the freshly connected home page
 	// flipped back to the LAN IP and local flag until the next tick.
 	stateEpoch atomic.Int64
+
+	coreSinkOnce sync.Once
+	coreSink     *guiCoreLogWriter
+}
+
+// guiCoreLogWriter streams mihomo's stdout/stderr line-by-line into the GUI
+// log panel for the entire lifetime of the window without ever returning a
+// write error that could stop os/exec's copier or block the core process.
+type guiCoreLogWriter struct {
+	mu  sync.Mutex
+	rem string
+	ui  *natUI
+}
+
+func (w *guiCoreLogWriter) Write(p []byte) (int, error) {
+	if w == nil || w.ui == nil || len(p) == 0 {
+		return len(p), nil
+	}
+	if w.ui.ctx != nil && w.ui.ctx.Err() != nil {
+		return len(p), nil
+	}
+	w.mu.Lock()
+	data := w.rem + string(p)
+	var lines []string
+	for {
+		idx := strings.IndexByte(data, '\n')
+		if idx < 0 {
+			break
+		}
+		line := strings.TrimSpace(strings.TrimSuffix(data[:idx], "\r"))
+		if line != "" {
+			lines = append(lines, line)
+		}
+		data = data[idx+1:]
+	}
+	if len(data) > 64*1024 {
+		data = data[len(data)-64*1024:]
+	}
+	w.rem = data
+	w.mu.Unlock()
+
+	for _, line := range lines {
+		if w.ui.ctx != nil && w.ui.ctx.Err() != nil {
+			break
+		}
+		lv, msg := parseCoreLine(line)
+		w.ui.sync(func() { w.ui.addLogFull(msg, lv, true) })
+	}
+	return len(p), nil
+}
+
+func (u *natUI) coreLogWriter() io.Writer {
+	u.coreSinkOnce.Do(func() {
+		u.coreSink = &guiCoreLogWriter{ui: u}
+	})
+	return u.coreSink
 }
 
 // s scales a length (width, height, radius) from the design grid to pixels.
@@ -750,8 +805,22 @@ func (u *natUI) statusLoop() {
 	// show. Three misses in a row (≥6s, and each probe already waits 8s on
 	// a hanging tunnel) is death; one slow answer must not trip it.
 	// Track both hard outages and "half-dead" (high loss or <35 KB/s) sessions
-	// using the same healthMonitor as the detached guard.
+	// using the same healthMonitor as the detached guard. External probes run
+	// on healthInterval (~8s) while local state/traffic still refresh every 2s.
 	mon := newHealthMonitor(time.Now())
+	var (
+		lastProbeAt time.Time
+		lastSession string
+		cachedExIP  string
+		cachedCC    string
+		cachedColo  string
+		cachedCity  string
+		cachedLat   int64 = -1
+	)
+	guardLog := func(msg string, isErr bool) {
+		fmt.Fprintln(os.Stderr, time.Now().Format("15:04:05")+" [guard] "+msg)
+		u.sync(func() { u.addLog("[守护] "+msg, isErr) })
+	}
 	for {
 		select {
 		case <-u.ctx.Done():
@@ -773,75 +842,99 @@ func (u *natUI) statusLoop() {
 		var lat int64 = -1
 		var up, down int64 = -1, -1
 		if st.Connected {
-			// Start from the persisted values and only override with fields the
-			// probe actually returned: a CN egress gets 403/empty JSON from
-			// speed.cloudflare.com/meta, and blanking the country/colo that the
-			// connect itself verified makes them flicker off right after
-			// "Connected" appears.
+			sessionKey := st.StartedAt + "|" + st.Endpoint
+			if st.OpenVPNNode != nil {
+				sessionKey += "|" + st.OpenVPNNode.id()
+			}
+			if sessionKey != lastSession {
+				lastSession = sessionKey
+				lastProbeAt = time.Time{}
+				cachedExIP, cachedCC, cachedColo, cachedCity = "", "", "", ""
+				cachedLat = -1
+				mon.reset(time.Now())
+			}
+			// Start from the persisted values and any cached probe fields.
 			exIP, cc, colo, city = st.ExitIP, st.Country, st.Colo, st.NodeCity
+			if cachedExIP != "" {
+				exIP = cachedExIP
+			}
+			if cachedCC != "" {
+				cc = cachedCC
+			}
+			if cachedColo != "" {
+				colo = cachedColo
+			}
+			if cachedCity != "" {
+				city = cachedCity
+			}
+			lat = cachedLat
 			if st.OpenVPNMode && st.OpenVPNNode != nil {
 				// The relay is the egress; the carrier's WARP country is not.
-				// Older sessions saved that carrier country into Country, so
-				// the node's ISO code is the only trustworthy flag source.
 				if ncc := strings.ToUpper(st.OpenVPNNode.CountryShort); ncc != "" {
 					cc = ncc
 				}
 				colo, city = "", ""
 			}
-			probeStart := time.Now()
-			probe, perr := fetchSessionProbe(st.MixedPort, st.Family)
-			probeElapsed := time.Since(probeStart)
-			if perr == nil {
-				if probe.ExitIP != "" {
-					exIP = probe.ExitIP
-				}
-				if probe.Country != "" {
-					cc = probe.Country
-				}
-				if probe.Colo != "" {
-					colo = probe.Colo
-				}
-				if probe.NodeCity != "" {
-					city = probe.NodeCity
-				}
-			}
-			delayGroup := "WARP"
-			if st.OpenVPNMode {
-				delayGroup = "OPENVPN"
-			}
-			if d, err := core.ProxyDelay(st.APIPort, delayGroup, "http://www.gstatic.com/generate_204"); err == nil {
-				lat = d
-			}
 			if u2, d2, err := core.Traffic(st.APIPort); err == nil {
 				up, down = u2, d2
 			}
 			liveBps := max(int64(0), up) + max(int64(0), down)
-			// Ownership decides who is allowed to repair, and it is decided by
-			// the claim: this GUI only gets it when nobody else holds it -
-			// which in practice means the detached guard from a CLI connect
-			// keeps the job it already has, and this window stays a watcher.
-			// Only a session with no living owner (the guard killed outright,
-			// then no process caught it) leaves the claim free for this tick.
-			// "Auto repair" is the user's switch over all of this: off means the
-			// session is left alone, and this window does not even claim it, so
-			// nobody else stands aside for a window that has opted out.
+
 			ownsHealth := false
 			if u.m.set.AutoRepair {
 				ownsHealth = claimHealthOwner(os.Getpid())
 			}
 
 			var act monitorAction
-			if ownsHealth && !u.m.working && !u.m.connecting && !u.repairing.Load() {
-				now := time.Now()
-				act = mon.observeProbe(now, perr == nil, probeElapsed, perr, liveBps)
-				if !act.repair && mon.needsThroughputCheck(now, perr == nil, probeElapsed, liveBps) {
-					bps, terr := probeThroughput(st.MixedPort, healthProbePayloadBytes, healthProbePayloadTimeout)
-					tAct := mon.observeThroughput(time.Now(), bps, terr)
-					if tAct.note != "" {
-						act.note = tAct.note
+			probeDue := lastProbeAt.IsZero() || time.Since(lastProbeAt) >= healthInterval
+			if probeDue && !u.m.working && !u.m.connecting && !u.repairing.Load() {
+				lastProbeAt = time.Now()
+				probeStart := lastProbeAt
+				probe, perr := fetchSessionProbe(st.MixedPort, st.Family)
+				probeElapsed := time.Since(probeStart)
+				if perr == nil {
+					if probe.ExitIP != "" {
+						exIP = probe.ExitIP
+						cachedExIP = probe.ExitIP
 					}
-					if tAct.repair {
-						act = tAct
+					if probe.Country != "" {
+						cc = probe.Country
+						cachedCC = probe.Country
+					}
+					if probe.Colo != "" {
+						colo = probe.Colo
+						cachedColo = probe.Colo
+					}
+					if probe.NodeCity != "" {
+						city = probe.NodeCity
+						cachedCity = probe.NodeCity
+					}
+				}
+				delayGroup := "WARP"
+				if st.OpenVPNMode {
+					delayGroup = "OPENVPN"
+				}
+				if d, err := core.ProxyDelay(st.APIPort, delayGroup, "http://www.gstatic.com/generate_204"); err == nil {
+					lat = d
+					cachedLat = d
+				}
+				if ownsHealth {
+					now := time.Now()
+					act = mon.observeProbe(now, perr == nil, probeElapsed, perr, liveBps)
+					if !act.repair && mon.needsThroughputCheck(now, perr == nil, probeElapsed, liveBps) {
+						bps, terr := probeThroughput(st.MixedPort, healthProbePayloadBytes, healthProbePayloadTimeout)
+						tAct := mon.observeThroughput(time.Now(), bps, terr)
+						if tAct.note != "" {
+							act.note = tAct.note
+						}
+						if tAct.repair {
+							act = tAct
+						} else if tAct.recovered {
+							act.recovered = true
+						}
+					}
+					if !act.repair && act.note != "" {
+						guardLog(act.note, !act.recovered)
 					}
 				}
 			}
@@ -850,22 +943,24 @@ func (u *natUI) statusLoop() {
 				if st.OpenVPNMode && st.OpenVPNNode != nil && act.measuredBps > 0 {
 					rememberVPNGateSpeed(st.OpenVPNNode.id(), act.measuredBps)
 				}
-				openvpnSession := st.OpenVPNMode
-				reasonNote := act.note
-				u.sync(func() {
-					switch {
-					case reasonNote != "":
-						u.addLog(reasonNote+"：正在自动切换可用节点…", true)
-					case openvpnSession:
-						u.addLog("数据面无响应（VPN Gate 出口失效）：正在更换出口节点…", true)
-					default:
-						u.addLog("数据面无响应（端点已失效）：正在自动切换到备用端点…", true)
-					}
-				})
+				switch {
+				case act.note != "":
+					guardLog(act.note+"：正在自动切换可用节点…", true)
+				case st.OpenVPNMode:
+					guardLog("数据面无响应（VPN Gate 出口失效）：正在更换出口节点…", true)
+				default:
+					guardLog("数据面无响应（端点已失效）：正在自动切换到备用端点…", true)
+				}
 				go func(st clientState) {
 					defer u.repairing.Store(false)
+					if connectStage == nil {
+						connectStage = u.connectStageHook
+						defer func() {
+							connectStage = nil
+						}()
+					}
 					logf := func(s string) {
-						u.sync(func() { u.addLog(s, false) })
+						guardLog(s, false)
 					}
 					var (
 						newState clientState
@@ -875,9 +970,10 @@ func (u *natUI) statusLoop() {
 						// Relay first: a VPN Gate node churns far faster than the
 						// WARP underlay, and rotating the underlay would silently
 						// drop the exit the user chose.
-						newState, ok = repairOpenVPNOnce(u.ctx, st, logf)
+						newState, ok = repairOpenVPNOnce(u.ctx, st, u.coreLogWriter(), logf)
 					} else {
 						opts := optionsFromState(st)
+						opts.coreLog = u.coreLogWriter()
 						tried := map[string]bool{}
 						newState, ok = repairOnce(u.ctx, opts, st.Endpoint, tried, logf)
 						if !ok {
@@ -889,11 +985,18 @@ func (u *natUI) statusLoop() {
 						}
 					}
 					if ok {
+						mon.reset(time.Now())
+						lastProbeAt = time.Time{}
+						msg := "已自动恢复：新端点 " + newState.Endpoint
+						if newState.OpenVPNMode && newState.OpenVPNNode != nil {
+							msg = fmt.Sprintf("已自动恢复：基础端点 %s + 出口 %s（%s）",
+								newState.Endpoint, newState.OpenVPNNode.id(), newState.OpenVPNNode.CountryShort)
+						}
+						guardLog(msg, false)
 						u.sync(func() {
 							u.stateEpoch.Add(1)
 							u.m.status = newState
 							u.m.connected = true
-							u.addLog("已自动恢复：新端点 "+newState.Endpoint, false)
 							u.invalidate()
 						})
 						return
@@ -907,12 +1010,16 @@ func (u *natUI) statusLoop() {
 						if st2, lerr := loadState(); lerr == nil {
 							u.m.status = st2
 						}
-						u.addLog("隧道已断开：代理已恢复、核心已停止。请重新点击连接", true)
+						u.addLog("[守护] 隧道已断开：代理已恢复、核心已停止。请重新点击连接", true)
 						u.invalidate()
 					})
 				}(st)
 			}
 		} else {
+			lastSession = ""
+			lastProbeAt = time.Time{}
+			cachedExIP, cachedCC, cachedColo, cachedCity = "", "", "", ""
+			cachedLat = -1
 			mon.reset(time.Now())
 			// Idle: the tiles show the machine itself. Latency is a direct
 			// TCP handshake; the public geo probe is throttled once it has an
@@ -1739,35 +1846,11 @@ func (u *natUI) connectAsync() {
 		o.innerProto = m.innerProto
 	}
 	proto := m.proto
-	// Tee the mihomo core's stdout into the log panel: the pipe is drained by a
-	// scanner that feeds each line back to the GUI thread, and closes by itself
-	// once the core dies (EOF) or the window does (ctx).
-	pr, pw := io.Pipe()
-	o.coreLog = pw
-	go func() {
-		sc := bufio.NewScanner(pr)
-		// Closing the read end unblocks the exec copier once the scanner exits
-		// (window closed), so the pipe can never wedge the child's stdout.
-		defer pr.Close()
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" {
-				continue
-			}
-			select {
-			case <-u.ctx.Done():
-				return
-			default:
-			}
-			lv, msg := parseCoreLine(line)
-			u.sync(func() { u.addLogFull(msg, lv, true) })
-		}
-	}()
+	o.coreLog = u.coreLogWriter()
 	go func() {
 		connectStage = u.connectStageHook
 		defer func() { connectStage = nil }()
 		err := runConnectCmd(ctx, o)
-		_ = pw.Close()
 		cancel()
 		u.sync(func() {
 			u.connectCancel = nil
