@@ -749,8 +749,9 @@ func (u *natUI) statusLoop() {
 	// "shows connected but every page fails" state this client must never
 	// show. Three misses in a row (≥6s, and each probe already waits 8s on
 	// a hanging tunnel) is death; one slow answer must not trip it.
-	tunnelFails := 0
-	const tunnelFailLimit = 3
+	// Track both hard outages and "half-dead" (high loss or <35 KB/s) sessions
+	// using the same healthMonitor as the detached guard.
+	mon := newHealthMonitor(time.Now())
 	for {
 		select {
 		case <-u.ctx.Done():
@@ -787,8 +788,10 @@ func (u *natUI) statusLoop() {
 				}
 				colo, city = "", ""
 			}
-			if probe, perr := fetchSessionProbe(st.MixedPort, st.Family); perr == nil {
-				tunnelFails = 0
+			probeStart := time.Now()
+			probe, perr := fetchSessionProbe(st.MixedPort, st.Family)
+			probeElapsed := time.Since(probeStart)
+			if perr == nil {
 				if probe.ExitIP != "" {
 					exIP = probe.ExitIP
 				}
@@ -801,15 +804,18 @@ func (u *natUI) statusLoop() {
 				if probe.NodeCity != "" {
 					city = probe.NodeCity
 				}
-			} else {
-				tunnelFails++
 			}
-			if d, err := core.ProxyDelay(st.APIPort, "WARP", "http://www.gstatic.com/generate_204"); err == nil {
+			delayGroup := "WARP"
+			if st.OpenVPNMode {
+				delayGroup = "OPENVPN"
+			}
+			if d, err := core.ProxyDelay(st.APIPort, delayGroup, "http://www.gstatic.com/generate_204"); err == nil {
 				lat = d
 			}
 			if u2, d2, err := core.Traffic(st.APIPort); err == nil {
 				up, down = u2, d2
 			}
+			liveBps := max(int64(0), up) + max(int64(0), down)
 			// Ownership decides who is allowed to repair, and it is decided by
 			// the claim: this GUI only gets it when nobody else holds it -
 			// which in practice means the detached guard from a CLI connect
@@ -824,23 +830,35 @@ func (u *natUI) statusLoop() {
 				ownsHealth = claimHealthOwner(os.Getpid())
 			}
 
-			// Tunnel death: the state says Connected but the data plane has
-			// not answered three probes in a row. Repair it first - rotate to
-			// another cached endpoint - and only stop when nothing left can
-			// carry traffic. Disconnecting used to be the first move, which
-			// put every repair on the user as another click, and the same dead
-			// endpoint answered that click because only a failing verify ever
-			// marked it dead. Never fires while a connect/disconnect/switch is
-			// in flight: those own the state. Never fires unowned either -
-			// another process already owns repair, and doing it anyway is how
-			// two schedules end up killing each other's cores.
-			if tunnelFails >= tunnelFailLimit && ownsHealth && !u.m.working && !u.m.connecting && u.repairing.CompareAndSwap(false, true) {
-				tunnelFails = 0
+			var act monitorAction
+			if ownsHealth && !u.m.working && !u.m.connecting && !u.repairing.Load() {
+				now := time.Now()
+				act = mon.observeProbe(now, perr == nil, probeElapsed, perr, liveBps)
+				if !act.repair && mon.needsThroughputCheck(now, perr == nil, probeElapsed, liveBps) {
+					bps, terr := probeThroughput(st.MixedPort, healthProbePayloadBytes, healthProbePayloadTimeout)
+					tAct := mon.observeThroughput(time.Now(), bps, terr)
+					if tAct.note != "" {
+						act.note = tAct.note
+					}
+					if tAct.repair {
+						act = tAct
+					}
+				}
+			}
+
+			if act.repair && ownsHealth && !u.m.working && !u.m.connecting && u.repairing.CompareAndSwap(false, true) {
+				if st.OpenVPNMode && st.OpenVPNNode != nil && act.measuredBps > 0 {
+					rememberVPNGateSpeed(st.OpenVPNNode.id(), act.measuredBps)
+				}
 				openvpnSession := st.OpenVPNMode
+				reasonNote := act.note
 				u.sync(func() {
-					if openvpnSession {
+					switch {
+					case reasonNote != "":
+						u.addLog(reasonNote+"：正在自动切换可用节点…", true)
+					case openvpnSession:
 						u.addLog("数据面无响应（VPN Gate 出口失效）：正在更换出口节点…", true)
-					} else {
+					default:
 						u.addLog("数据面无响应（端点已失效）：正在自动切换到备用端点…", true)
 					}
 				})
@@ -895,7 +913,7 @@ func (u *natUI) statusLoop() {
 				}(st)
 			}
 		} else {
-			tunnelFails = 0
+			mon.reset(time.Now())
 			// Idle: the tiles show the machine itself. Latency is a direct
 			// TCP handshake; the public geo probe is throttled once it has an
 			// answer (every 15th tick ≈ 30s) but retries briskly until the

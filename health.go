@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -37,11 +38,29 @@ import (
 const (
 	// healthInterval spaces the checks: shorter than a page load, long enough
 	// that an idle session costs nothing measurable.
-	healthInterval = 10 * time.Second
+	healthInterval = 8 * time.Second
 	// healthFailLimit consecutive failures before the endpoint counts as dead.
 	// One failure can be a busy core or a transient timeout; several spread
 	// over half a minute cannot.
 	healthFailLimit = 3
+	// Degraded ("half-dead") tunnel detection parameters:
+	//   - healthBadLimit triggers repair when rolling badness points reach 5
+	//     (e.g. 3 timeouts = 6, or 2 timeouts + 1 slow >3.5s squeak = 5, or
+	//     2 timeouts + 1 fast squeak + 1 timeout = 5), catching high-loss
+	//     tunnels that occasionally pass a tiny packet.
+	//   - healthMinUsableBps (35 KB/s over a 64 KiB probe) catches tunnels
+	//     where tiny pings pass but real web pages stall; 2 consecutive low
+	//     measurements trigger automatic rotation.
+	//   - healthActiveTrafficBps skips synthetic probes while the user is
+	//     already transferring >=40 KB/s of real traffic through mihomo.
+	healthBadLimit            = 5
+	healthSlowProbe           = 3500 * time.Millisecond
+	healthActiveTrafficBps    = 40 * 1024
+	healthProbePayloadBytes   = 64 * 1024
+	healthProbePayloadTimeout = 6 * time.Second
+	healthMinUsableBps        = 35 * 1024
+	healthSpeedCheckEvery     = 30 * time.Second
+	healthSpeedConfirmWait    = 6 * time.Second
 	// healthOwnerFile holds the pid of whoever currently owns this session's
 	// health check and repair. Exactly one owner at a time, enforced by O_EXCL
 	// and confirmed by whether that pid still runs - see claimHealthOwner.
@@ -152,9 +171,10 @@ func lostHealthOwner(pid int) bool {
 
 // healthResult is one check's outcome.
 type healthResult struct {
-	OK     bool
-	ExitIP string
-	Err    error
+	OK      bool
+	ExitIP  string
+	Elapsed time.Duration
+	Err     error
 }
 
 // healthVerdict is what one data-plane check means for the session: how many
@@ -188,31 +208,187 @@ func judgeHealth(fails int, ok bool) healthVerdict {
 	return healthVerdict{fails: 0, repair: true}
 }
 
-// checkDataPlane asks the question status used to assume the answer to: does a
-// real HTTPS request through the local mixed port complete right now? A v6-only
-// session is probed against a v6 literal, because its public sources are v4
-// hostnames that the tunnel intentionally cannot reach.
+// healthMonitor tracks both hard outages and "half-dead" (high packet loss or
+// severely throttled <35 KB/s) sessions so the guard rotates before the user
+// has to manually test Google and reconnect.
+type healthMonitor struct {
+	badPoints   int
+	slowStreak  int
+	hadTrouble  bool
+	lastSpeedAt time.Time
+}
+
+type monitorAction struct {
+	repair      bool
+	recovered   bool
+	degraded    bool
+	measuredBps int64
+	note        string
+}
+
+func newHealthMonitor(now time.Time) *healthMonitor {
+	return &healthMonitor{lastSpeedAt: now}
+}
+
+func (m *healthMonitor) reset(now time.Time) {
+	m.badPoints = 0
+	m.slowStreak = 0
+	m.hadTrouble = false
+	m.lastSpeedAt = now
+}
+
+// observeProbe updates rolling health from one connectivity probe and current
+// live traffic (bytes/s from mihomo /traffic).
+func (m *healthMonitor) observeProbe(now time.Time, ok bool, elapsed time.Duration, err error, liveBps int64) monitorAction {
+	if liveBps >= healthActiveTrafficBps {
+		rec := m.hadTrouble && m.badPoints == 1 && m.slowStreak == 0
+		if m.badPoints > 0 {
+			m.badPoints--
+		}
+		m.slowStreak = 0
+		if m.badPoints == 0 {
+			rec = m.hadTrouble
+			m.hadTrouble = false
+		}
+		return monitorAction{recovered: rec}
+	}
+	if !ok {
+		m.hadTrouble = true
+		m.badPoints += 2
+		if m.badPoints >= healthBadLimit {
+			m.reset(now)
+			return monitorAction{
+				repair: true,
+				note:   fmt.Sprintf("数据面探测持续失败（累计异常分达到阈值）: %v", err),
+			}
+		}
+		return monitorAction{
+			note: fmt.Sprintf("数据面探测失败 (异常分 %d/%d): %v", m.badPoints, healthBadLimit, err),
+		}
+	}
+	if elapsed >= healthSlowProbe {
+		m.hadTrouble = true
+		m.badPoints++
+		if m.badPoints >= healthBadLimit {
+			m.reset(now)
+			return monitorAction{
+				repair:   true,
+				degraded: true,
+				note:     fmt.Sprintf("隧道响应严重迟缓（探测耗时 %.1fs，累计异常分达到阈值）", elapsed.Seconds()),
+			}
+		}
+		return monitorAction{
+			note: fmt.Sprintf("数据面响应偏慢（%.1fs，异常分 %d/%d）", elapsed.Seconds(), m.badPoints, healthBadLimit),
+		}
+	}
+	if m.badPoints > 0 {
+		m.badPoints--
+	}
+	if m.badPoints == 0 && m.slowStreak == 0 && m.hadTrouble {
+		m.hadTrouble = false
+		return monitorAction{recovered: true, note: "数据面已恢复"}
+	}
+	return monitorAction{}
+}
+
+// needsThroughputCheck reports whether a lightweight 64 KiB download probe
+// should run on this tick to catch "pings pass, pages stall" zombie relays.
+func (m *healthMonitor) needsThroughputCheck(now time.Time, probeOK bool, probeElapsed time.Duration, liveBps int64) bool {
+	if !probeOK || liveBps >= healthActiveTrafficBps {
+		return false
+	}
+	if m.slowStreak > 0 {
+		return m.lastSpeedAt.IsZero() || now.Sub(m.lastSpeedAt) >= healthSpeedConfirmWait
+	}
+	if probeElapsed >= healthSlowProbe || m.badPoints >= 2 {
+		return m.lastSpeedAt.IsZero() || now.Sub(m.lastSpeedAt) >= healthSpeedConfirmWait
+	}
+	return m.lastSpeedAt.IsZero() || now.Sub(m.lastSpeedAt) >= healthSpeedCheckEvery
+}
+
+// observeThroughput records the outcome of a 64 KiB micro-throughput probe.
+// Two consecutive measurements below healthMinUsableBps trigger rotation.
+func (m *healthMonitor) observeThroughput(now time.Time, bps int64, err error) monitorAction {
+	m.lastSpeedAt = now
+	if err != nil || bps < healthMinUsableBps {
+		m.hadTrouble = true
+		m.slowStreak++
+		if m.slowStreak >= 2 {
+			m.reset(now)
+			if err != nil && bps <= 0 {
+				return monitorAction{
+					repair:   true,
+					degraded: true,
+					note:     fmt.Sprintf("隧道半死卡顿（连续 2 次下载探测中断/超时: %v）", err),
+				}
+			}
+			return monitorAction{
+				repair:      true,
+				degraded:    true,
+				measuredBps: bps,
+				note:        fmt.Sprintf("隧道半死卡顿（连续 2 次实测速率过低，当前 ≈ %d KB/s < %d KB/s）", bps/1024, healthMinUsableBps/1024),
+			}
+		}
+		if err != nil && bps <= 0 {
+			return monitorAction{
+				degraded: true,
+				note:     fmt.Sprintf("隧道吞吐探测异常 (1/2): %v，即将复核…", err),
+			}
+		}
+		return monitorAction{
+			degraded:    true,
+			measuredBps: bps,
+			note:        fmt.Sprintf("隧道速率过低 (1/2)：实测 ≈ %d KB/s（低于 %d KB/s），即将复核…", bps/1024, healthMinUsableBps/1024),
+		}
+	}
+	wasSlow := m.slowStreak > 0
+	m.slowStreak = 0
+	if wasSlow && m.badPoints == 0 {
+		m.hadTrouble = false
+		return monitorAction{recovered: true, measuredBps: bps, note: fmt.Sprintf("隧道速率已恢复（≈ %d KB/s）", bps/1024)}
+	}
+	return monitorAction{measuredBps: bps}
+}
+
+func sampleLiveTrafficBps(apiPort int) int64 {
+	if apiPort <= 0 {
+		return 0
+	}
+	up, down, err := core.Traffic(apiPort)
+	if err != nil {
+		return 0
+	}
+	if up < 0 {
+		up = 0
+	}
+	if down < 0 {
+		down = 0
+	}
+	return up + down
+}
+
 func checkDataPlane(mixedPort int, family string) healthResult {
 	if mixedPort <= 0 {
 		return healthResult{Err: fmt.Errorf("no mixed port in state")}
 	}
+	started := time.Now()
 	if family == famV6 {
 		ip, err := fetchV6Probe(mixedPort)
 		if err != nil {
-			return healthResult{Err: err}
+			return healthResult{Elapsed: time.Since(started), Err: err}
 		}
-		return healthResult{OK: true, ExitIP: ip}
+		return healthResult{OK: true, ExitIP: ip, Elapsed: time.Since(started)}
 	}
 	probe, err := fetchSessionProbe(mixedPort, family)
 	if err != nil {
-		return healthResult{Err: err}
+		return healthResult{Elapsed: time.Since(started), Err: err}
 	}
 	if family == famBoth {
 		if _, err := fetchV6Probe(mixedPort); err != nil {
-			return healthResult{Err: fmt.Errorf("IPv6: %w", err)}
+			return healthResult{Elapsed: time.Since(started), Err: fmt.Errorf("IPv6: %w", err)}
 		}
 	}
-	return healthResult{OK: true, ExitIP: probe.ExitIP}
+	return healthResult{OK: true, ExitIP: probe.ExitIP, Elapsed: time.Since(started)}
 }
 
 // optionsFromState rebuilds connect options from a persisted session, so a
@@ -565,6 +741,7 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 	}
 	opts := optionsFromState(st)
 	opts.openvpnNode = nil
+	opts.openvpnSpeedGate = true
 	bin, err := core.EnsureBinary(cDir, opts.corePath)
 	if err != nil {
 		logf(fmt.Sprintf("修复失败：核心不可用：%v", err))
@@ -575,9 +752,17 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 		logf(fmt.Sprintf("修复失败：无法获取端点列表：%v", err))
 		return clientState{}, false
 	}
-	// Forced refresh: the relay pool is the thing being repaired, and re-picking
-	// from the same cached list would walk straight back into the dead nodes.
-	nodes, err := vpnGateNodesFor(ctx, results, run, true)
+	// Mark the failing/degraded relay first so freshVPNGateNodes skips it and
+	// reconnects do not immediately walk back into the same bad node.
+	if st.OpenVPNNode != nil {
+		markVPNGateFailed(st.OpenVPNNode.id())
+	}
+	// Reuse a recently fetched (<30 min) VPN Gate cache to save 20s+ of CSV/IP
+	// enrichment latency during live auto-repair; force a fresh fetch only when
+	// the cache is older.
+	_, cacheAt := loadVPNGateCache()
+	forceFetch := cacheAt.IsZero() || time.Since(cacheAt) > 30*time.Minute
+	nodes, err := vpnGateNodesFor(ctx, results, run, forceFetch)
 	if err != nil {
 		logf(fmt.Sprintf("修复失败：无法获取 VPN Gate 节点：%v", err))
 		return clientState{}, false
@@ -625,13 +810,33 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 
 	const maxAttempts = 6
 	attempts := 0
+	slowRejects := 0
 	relayIdx := 0
+	var (
+		bestSlowBase cachedEndpoint
+		bestSlowNode *vpnGateNode
+		bestSlowBps  int64
+	)
+	commitRepair := func(state clientState, node vpnGateNode) (clientState, bool) {
+		clearVPNGateFailure(node.id())
+		rememberLastGoodVPNGate(node)
+		if cur, cerr := loadState(); cerr == nil && !cur.Connected {
+			logf("会话已断开，回滚刚启动的核心")
+			rollbackRepair(state, logf)
+			return clientState{}, false
+		}
+		if saveState(state) != nil {
+			logf("状态保存失败")
+		}
+		logf("已切换到 VPN Gate " + node.id())
+		return state, true
+	}
 	for baseIdx, ce := range bases {
 		var baseTrack openvpnBaseTracker
 		hasMoreBases := baseIdx < len(bases)-1
 		for step := 0; step < len(relays); step++ {
 			if attempts >= maxAttempts || ctx.Err() != nil {
-				return clientState{}, false
+				break
 			}
 			if cur, cerr := loadState(); cerr == nil && !cur.Connected {
 				logf("会话已断开，中止修复")
@@ -650,6 +855,22 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 			}
 			state, serr := startAndVerify(ctx, opts, ce, run, bin, cDir, "OpenVPN", nil)
 			if serr != nil {
+				var slow *slowRelayError
+				if errors.As(serr, &slow) {
+					baseTrack.record(node.id(), serr, hasMoreBases)
+					if slow.bps > bestSlowBps {
+						nCopy := node
+						bestSlowBase = ce
+						bestSlowNode = &nCopy
+						bestSlowBps = slow.bps
+					}
+					slowRejects++
+					logf(fmt.Sprintf("出口 %s 速度偏慢（≈%d KB/s），换下一个中继…", node.id(), slow.bps/1024))
+					if slowRejects >= openvpnSpeedRetries {
+						opts.openvpnAcceptSlow = true
+					}
+					continue
+				}
 				rotateBase, clearRelays, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
 				for _, id := range clearRelays {
 					clearVPNGateFailure(id)
@@ -665,18 +886,22 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, logf func(string)) (
 				}
 				continue
 			}
-			clearVPNGateFailure(node.id())
-			rememberLastGoodVPNGate(node)
-			if cur, cerr := loadState(); cerr == nil && !cur.Connected {
-				logf("会话已断开，回滚刚启动的核心")
-				rollbackRepair(state, logf)
-				return clientState{}, false
-			}
-			if saveState(state) != nil {
-				logf("状态保存失败")
-			}
-			logf("已切换到 VPN Gate " + node.id())
-			return state, true
+			return commitRepair(state, node)
+		}
+		if attempts >= maxAttempts || ctx.Err() != nil {
+			break
+		}
+	}
+	if bestSlowNode != nil && ctx.Err() == nil {
+		logf(fmt.Sprintf("其余候选未连上，回退保留已验证可用的出口 %s（≈%d KB/s）…", bestSlowNode.id(), bestSlowBps/1024))
+		if prev, serr := loadState(); serr == nil {
+			_ = stopRecordedCore(prev)
+		}
+		fbOpts := opts
+		fbOpts.openvpnNode = bestSlowNode
+		fbOpts.openvpnAcceptSlow = true
+		if state, serr := startAndVerify(ctx, fbOpts, bestSlowBase, run, bin, cDir, "OpenVPN", nil); serr == nil {
+			return commitRepair(state, *bestSlowNode)
 		}
 	}
 	return clientState{}, false
@@ -777,7 +1002,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 	}
 	logf(fmt.Sprintf("数据面守护已启动 (port=%d)", opts.mixedPort))
 
-	var fails int
+	mon := newHealthMonitor(time.Now())
 	// psiphonRestarts / psiphonUnderlayFails count consecutive Psiphon-side
 	// repairs for a Psiphon session; both reset the moment the data plane
 	// answers (see psiphon_health.go).
@@ -810,21 +1035,38 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			logf("系统代理已不再指向本端口，退出守护")
 			return nil
 		}
+		now := time.Now()
+		liveBps := sampleLiveTrafficBps(st.APIPort)
 		res := checkDataPlane(st.MixedPort, st.Family)
-		if verdict := judgeHealth(fails, res.OK); !verdict.repair {
-			fails = verdict.fails
+		act := mon.observeProbe(now, res.OK, res.Elapsed, res.Err, liveBps)
+		if !act.repair && mon.needsThroughputCheck(now, res.OK, res.Elapsed, liveBps) {
+			bps, terr := probeThroughput(st.MixedPort, healthProbePayloadBytes, healthProbePayloadTimeout)
+			tAct := mon.observeThroughput(time.Now(), bps, terr)
+			if tAct.note != "" {
+				act.note = tAct.note
+			}
+			if tAct.repair {
+				act = tAct
+			} else if tAct.recovered {
+				act.recovered = true
+			}
+		}
+		if !act.repair {
 			if res.OK {
 				psiphonRestarts = 0
 				psiphonUnderlayFails = 0
-				if verdict.recovered {
-					logf("数据面已恢复")
-				}
-				continue
 			}
-			logf(fmt.Sprintf("数据面探测失败 (%d/%d): %v", fails, healthFailLimit, res.Err))
+			if act.note != "" {
+				logf(act.note)
+			}
 			continue
 		}
-		logf(fmt.Sprintf("数据面探测失败 (%d/%d): %v", healthFailLimit, healthFailLimit, res.Err))
+		if act.note != "" {
+			logf(act.note)
+		}
+		if st.OpenVPNMode && st.OpenVPNNode != nil && act.measuredBps > 0 {
+			rememberVPNGateSpeed(st.OpenVPNNode.id(), act.measuredBps)
+		}
 		// An OpenVPN session is repaired by rotating the VPN Gate relay, not by
 		// rotating the underlay: the relay is the part that churns, and a bare
 		// WARP re-connect would silently drop the exit the user chose.
@@ -832,9 +1074,9 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			if fe := ctx.Err(); fe != nil {
 				return nil
 			}
-			logf("OpenVPN 出口失效：更换 VPN Gate 节点并重建会话…")
+			logf("OpenVPN 出口失效或半死卡顿：更换 VPN Gate 节点并重建会话…")
 			if _, ok := repairOpenVPNOnce(ctx, st, logf); ok {
-				fails = 0
+				mon.reset(time.Now())
 				continue
 			}
 			if done, derr := loadState(); derr == nil && !done.Connected {
@@ -876,7 +1118,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 				if _, ok := repairOnce(ctx, repairOpts, st.Endpoint, tried, logf); ok {
 					logf("已在新的基础端点上恢复 Psiphon 会话")
 					psiphonUnderlayFails = 0
-					fails = 0
+					mon.reset(time.Now())
 					continue
 				}
 				// Every cached candidate failed: the cache is stale as a whole.
@@ -885,7 +1127,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 				if _, ok := repairOnce(ctx, repairOpts, st.Endpoint, tried, logf); ok {
 					logf("已在新的基础端点上恢复 Psiphon 会话")
 					psiphonUnderlayFails = 0
-					fails = 0
+					mon.reset(time.Now())
 					continue
 				}
 				if done, derr := loadState(); derr == nil && !done.Connected {
@@ -911,7 +1153,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			} else {
 				logf("Psiphon 重启后数据面仍不通")
 			}
-			fails = 0
+			mon.reset(time.Now())
 			continue
 		}
 		repairOpts := optionsFromState(st)
@@ -922,6 +1164,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			return nil
 		}
 		if _, ok := repairOnce(ctx, repairOpts, st.Endpoint, tried, logf); ok {
+			mon.reset(time.Now())
 			continue
 		}
 		// Every cached candidate failed: the cache is stale as a whole. One
@@ -930,6 +1173,7 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 		logf("缓存端点全部失活，重新扫描…")
 		repairOpts.scanNow = true
 		if _, ok := repairOnce(ctx, repairOpts, st.Endpoint, tried, logf); ok {
+			mon.reset(time.Now())
 			continue
 		}
 		// Not every exhausted repair means the network gave up on us - the
