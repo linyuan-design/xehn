@@ -724,6 +724,23 @@ func runConnectPsiphon(ctx context.Context, opts options) error {
 // exit's dials, then mihomo's native openvpn outbound — pointed at one VPN Gate
 // relay — becomes the client's final egress. No external OpenVPN binary and no
 // sidecar SOCKS port: dialer-proxy chains the outbounds inside one core.
+// openvpnFallbackProtos lists alternate base protocols to try when the user's
+// chosen underlay is completely blocked by ISP QoS/DPI.
+func openvpnFallbackProtos(primary string) []string {
+	switch primary {
+	case protoAWG:
+		return []string{protoMASQUE, protoMASQUEH2}
+	case protoWG:
+		return []string{protoAWG, protoMASQUE, protoMASQUEH2}
+	case protoMASQUE:
+		return []string{protoMASQUEH2, protoAWG}
+	case protoMASQUEH2:
+		return []string{protoMASQUE, protoAWG}
+	default:
+		return nil
+	}
+}
+
 func runConnectOpenVPN(ctx context.Context, opts options) error {
 	if opts.mixedPort == 0 {
 		opts.mixedPort = core.DefaultMixedPort
@@ -731,10 +748,17 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	if opts.apiPort == 0 {
 		opts.apiPort = core.DefaultAPIPort
 	}
+	if opts.earlyStop == 0 {
+		opts.earlyStop = connectEarlyStop
+	}
 	// The relay rides the base protocol, so a nested base would need a third
 	// outbound for no benefit. Refuse it here, exactly like Psiphon does.
 	if protoChained(opts.proto) || opts.through != "" {
 		return fmt.Errorf("OpenVPN 出口暂不支持与嵌套协议（GOOL / MASQUE in MASQUE）组合：请用 wg / awg / masque 作为基础协议")
+	}
+	if !opts.baseFallbackInit && opts.pick == "" {
+		opts.baseFallbackInit = true
+		opts.baseFallbacks = openvpnFallbackProtos(opts.proto)
 	}
 	// VPN Gate relays are IPv4-only, and mihomo's openvpn outbound cannot carry
 	// an IPv6 tunnel. Forcing v4 here also keys the scan cache correctly and
@@ -748,6 +772,20 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	startedAt := time.Now()
 
 	label := protoLabel(opts.proto) + "+OpenVPN"
+	tryNextBaseProto := func(reason string) (bool, error) {
+		if opts.pick != "" || len(opts.baseFallbacks) == 0 || ctx.Err() != nil {
+			return false, nil
+		}
+		next := opts.baseFallbacks[0]
+		fb := opts
+		fb.proto = next
+		fb.baseFallbacks = opts.baseFallbacks[1:]
+		fb.scanNow = false
+		fb.openvpnAcceptSlow = true
+		stageMsg(fmt.Sprintf("[%s] %s，自动切换 %s 底座重试…", label, reason, protoLabel(next)))
+		return true, runConnectOpenVPN(ctx, fb)
+	}
+
 	stageMsg(fmt.Sprintf("[%s] 开始连接：先起基础协议，再经 VPN Gate 节点出站…", label))
 
 	if err := ensureAccount(ctx, opts); err != nil {
@@ -756,6 +794,17 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	stageMsg(fmt.Sprintf("[%s] 账号就绪，读取/扫描基础端点…", label))
 	results, run, err := runCachedScan(ctx, opts)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if opts.pick == "" && !opts.scanNow {
+			invalidateScanCache(scanKeyFor(opts), opts.ipv6)
+			opts.scanNow = true
+			return runConnectOpenVPN(ctx, opts)
+		}
+		if ok, ferr := tryNextBaseProto("当前基础协议端口不可达"); ok {
+			return ferr
+		}
 		return fmt.Errorf("scan failed: %w", err)
 	}
 	var cands []cachedEndpoint
@@ -775,10 +824,14 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			cands = cands[:connectMaxAttempts]
 		}
 		if len(cands) == 0 {
+			invalidateScanCache(scanKeyFor(opts), opts.ipv6)
 			if !opts.scanNow {
 				stageMsg(fmt.Sprintf("[%s] 无可用基础端点，重新扫描…", label))
 				opts.scanNow = true
 				return runConnectOpenVPN(ctx, opts)
+			}
+			if ok, ferr := tryNextBaseProto("当前基础协议未扫到可用端点"); ok {
+				return ferr
 			}
 			return fmt.Errorf("no working endpoint found")
 		}
@@ -795,6 +848,9 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 		return fmt.Errorf("Clash 核心不可用（应位于 %s）：%w；请放入 mihomo.exe 或用底栏「核心」按钮下载", core.CoreInDir(cDir), err)
 	}
 	if !protoSupportedBy(bin, cDir, opts.proto) {
+		if ok, ferr := tryNextBaseProto("当前核心不支持该底座协议"); ok {
+			return ferr
+		}
 		return fmt.Errorf("当前 Core 不支持 %s 协议配置，请升级 Core（Mihomo 官方最新版）", protoLabel(opts.proto))
 	}
 	if !protoSupportedBy(bin, cDir, probeOpenVPNProto) {
@@ -851,6 +907,7 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	tried := 0
 	slowRejects := 0
 	relayIdx := 0
+	anyBaseConfirmed := false
 	var (
 		bestSlowBase cachedEndpoint
 		bestSlowNode *vpnGateNode
@@ -913,6 +970,7 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 					// it behind everything else — remember the fastest working
 					// candidate as a fallback, and try another relay.
 					baseTrack.record(node.id(), serr, hasMoreBases)
+					anyBaseConfirmed = true
 					if slow.bps > bestSlowBps {
 						nCopy := node
 						bestSlowBase = ce
@@ -938,12 +996,18 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			// about the WARP underlay, and evicting a healthy endpoint here would
 			// poison the scan cache for every later session.
 			rotateBase, markFailed := baseTrack.record(node.id(), serr, hasMoreBases)
+			if baseTrack.confirmed {
+				anyBaseConfirmed = true
+			}
 			if markFailed {
 				// The relay itself failed; the phone client's 10-minute memory keeps
 				// the next attempt (or the automatic retry scan) off this node.
 				markVPNGateFailed(node.id())
 			}
 			if rotateBase {
+				if !baseTrack.confirmed {
+					markEndpointDead(opts, ce)
+				}
 				// A dead or DPI-dropped underlay fails every relay; move on to
 				// the next base endpoint instead of burning the remaining
 				// combinations on this one. Because relayIdx keeps advancing,
@@ -973,13 +1037,21 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			return ctx.Err()
 		}
 	}
-	// Every combination failed: the snapshot may be stale on both axes. One
-	// fresh scan and a forced VPN Gate refetch, then report honestly.
+	// Every combination failed: drop the dead scan snapshot first, then run one
+	// fresh scan + forced VPN Gate refetch; if the underlay still never carried
+	// a packet, fall back to alternate base protocols (e.g. MASQUE).
 	if opts.pick == "" && !opts.scanNow {
+		invalidateScanCache(scanKeyFor(opts), opts.ipv6)
 		stageMsg(fmt.Sprintf("[%s] 全部组合失败，重新扫描基础端点并刷新 VPN Gate 节点…", label))
 		opts.scanNow = true
 		opts.openvpnAcceptSlow = true
 		return runConnectOpenVPN(ctx, opts)
+	}
+	if !anyBaseConfirmed {
+		invalidateScanCache(scanKeyFor(opts), opts.ipv6)
+		if ok, ferr := tryNextBaseProto("当前基础协议端点握手全部超时"); ok {
+			return ferr
+		}
 	}
 	return fmt.Errorf("connect failed: OpenVPN 出口在 %d 个组合上均未通过验证: %w", tried, lastErr)
 }

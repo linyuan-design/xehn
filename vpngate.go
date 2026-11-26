@@ -646,6 +646,12 @@ func saveVPNGateUnderlay(endpoint string) {
 	_ = os.WriteFile(p, raw, 0o600)
 }
 
+func clearVPNGateUnderlay() {
+	if p, err := vpnGateUnderlayPath(); err == nil {
+		_ = os.Remove(p)
+	}
+}
+
 // vpnGateNodesFor returns the pool a connect runs with: a fresh cache when it
 // has one, otherwise a live fetch. A stale cache is still preferable to no
 // nodes when the network blocks the API, so the fetch failure path falls back
@@ -1669,12 +1675,21 @@ func sortVPNGateNodesByLatency(nodes []vpnGateNode) {
 
 // vpnShortErr trims an error for the one-line popup note.
 func vpnShortErr(err error) string {
+	return trimRunes(err, 60)
+}
+
+// vpnLogErr keeps enough room for multi-step fetch diagnostics in the run log.
+func vpnLogErr(err error) string {
+	return trimRunes(err, 160)
+}
+
+func trimRunes(err error, limit int) string {
 	if err == nil {
 		return ""
 	}
 	s := err.Error()
-	if r := []rune(s); len(r) > 60 {
-		s = string(r[:60]) + "…"
+	if r := []rune(s); len(r) > limit {
+		s = string(r[:limit]) + "…"
 	}
 	return s
 }

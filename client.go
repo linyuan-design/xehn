@@ -212,6 +212,9 @@ func ensureAccount(ctx context.Context, opts options) error {
 	}
 	if a, err := loadAccount(path); err == nil {
 		applyAccount(a)
+		if (opts.proto == protoMASQUE || opts.proto == protoMASQUEH2 || opts.proto == protoMASQUEMASQUE) && masqueAcct == nil {
+			return runRegisterCmd(ctx, opts)
+		}
 		return nil
 	}
 	return runRegisterCmd(ctx, opts)
@@ -260,6 +263,29 @@ func scanKeyFor(opts options) string {
 	return opts.proto
 }
 
+func hasWorkingCachedEndpoint(results []cachedEndpoint) bool {
+	for _, ce := range results {
+		if ce.Working && ce.Endpoint != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// invalidateScanCache removes the stored scan entry for proto+family so the
+// next connect or node refresh runs a live sweep instead of walking endpoints
+// that just proved dead.
+func invalidateScanCache(proto string, ipv6 bool) {
+	if proto == "" {
+		return
+	}
+	store, err := cache.Open(cache.Options{TTL: scanTTL})
+	if err != nil {
+		return
+	}
+	_ = store.Delete(scanCacheKey(proto, ipv6))
+}
+
 // runCachedScan returns endpoints from a fresh cache, or scans and caches them.
 // The returned run is the run the *connect config* renders: the inner protocol
 // for a chain (the outer half comes from the `outer` nest), the protocol
@@ -273,7 +299,7 @@ func runCachedScan(ctx context.Context, opts options) ([]cachedEndpoint, protoRu
 	if !opts.scanNow {
 		if raw, ok := store.Get(key); ok {
 			var cs cachedScan
-			if json.Unmarshal(raw, &cs) == nil && len(cs.Results) > 0 {
+			if json.Unmarshal(raw, &cs) == nil && hasWorkingCachedEndpoint(cs.Results) {
 				if opts.through != "" {
 					stageMsg(fmt.Sprintf("[%s] 使用缓存端点（%d 个，扫描于 %s）",
 						protoLabel(opts.proto), len(cs.Results), cs.At.Format("01-02 15:04")))
@@ -325,6 +351,9 @@ func mustParseProto(p string) protoRun {
 func doScan(ctx context.Context, opts options) ([]cachedEndpoint, protoRun, error) {
 	if err := ensureAccount(ctx, opts); err != nil {
 		return nil, protoRun{}, err
+	}
+	if opts.proto == protoAWG && opts.scanNow && !opts.genJunk {
+		genJunkParams()
 	}
 	run, ips, err := setupScan(opts)
 	if err != nil {

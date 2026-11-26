@@ -883,6 +883,9 @@ func repairOpenVPNOnce(ctx context.Context, st clientState, coreLog io.Writer, l
 				}
 				logf(fmt.Sprintf("出口 %s 修复失败: %v", node.id(), serr))
 				if rotateBase {
+					if !baseTrack.confirmed {
+						markEndpointDead(opts, ce)
+					}
 					logf(fmt.Sprintf("基础端点 %s 连续 %d 次中继握手超时，切换下一个基础端点…",
 						ce.Endpoint, baseTrack.timeouts))
 					break
@@ -942,6 +945,11 @@ func rollbackRepair(state clientState, logf func(string)) {
 func giveUp(logf func(string)) {
 	logf("所有备用端点均无法恢复：正在恢复系统代理并停止核心")
 	if prev, err := loadState(); err == nil {
+		// Evict the exhausted scan cache and remembered underlay immediately so
+		// the next manual connect or node refresh performs a real rescan instead
+		// of walking dead endpoints again.
+		invalidateScanCache(prev.Proto, prev.Family == famV6)
+		clearVPNGateUnderlay()
 		if prev.CorePID > 0 {
 			_ = stopRecordedCore(prev)
 		}

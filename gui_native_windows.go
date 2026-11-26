@@ -1220,7 +1220,7 @@ func (u *natUI) refreshVPNGatePool(force ...bool) {
 			case len(u.m.vpnNodes) == 0:
 				if err != nil {
 					u.m.vpnPoolNote = trf("节点列表获取失败：%s（点击重试）", vpnShortErr(err))
-					u.addLog(trf("VPN Gate 节点获取失败：%s", vpnShortErr(err)), true)
+					u.addLog(trf("VPN Gate 节点获取失败：%s", vpnLogErr(err)), true)
 				} else {
 					u.m.vpnPoolNote = tr("节点列表获取失败：请点击重试")
 					u.addLog(tr("VPN Gate 节点获取失败：节点列表为空"), true)
@@ -1230,7 +1230,7 @@ func (u *natUI) refreshVPNGatePool(force ...bool) {
 				// the popup has nothing else to display.
 				u.m.vpnPoolNote = ""
 				if err != nil {
-					u.addLog(trf("VPN Gate 节点刷新失败：%s（沿用缓存列表）", vpnShortErr(err)), true)
+					u.addLog(trf("VPN Gate 节点刷新失败：%s（沿用缓存列表）", vpnLogErr(err)), true)
 				}
 			}
 			u.invalidate()
@@ -1259,8 +1259,10 @@ func (u *natUI) fetchVPNGatePool() ([]vpnGateNode, string, error) {
 		directErr = err
 	}
 
+	usedProxy := false
 	proxyErr := directErr
 	if st, lerr := loadState(); lerr == nil && st.Connected && st.MixedPort > 0 {
+		usedProxy = true
 		if raw, perr := fetchVPNGateViaProxy(u.ctx, st.MixedPort); perr == nil {
 			if nodes := parseVPNGateCSV(raw); len(nodes) > 0 {
 				u.sync(func() { u.m.vpnPoolNote = tr("正在识别家宽/机房节点…") })
@@ -1282,18 +1284,22 @@ func (u *natUI) fetchVPNGatePool() ([]vpnGateNode, string, error) {
 		u.addLog(tr("直连不可用，正在经 WARP 获取节点…"), false)
 		u.invalidate()
 	})
-	nodes, werr := u.fetchVPNGatePoolViaWARP()
+	nodes, viaRoute, werr := u.fetchVPNGatePoolViaWARP()
 	if werr != nil {
-		return nil, "", fmt.Errorf("%s；WARP: %s", vpnShortErr(proxyErr), vpnShortErr(werr))
+		prefix := "直连不可用"
+		if usedProxy && proxyErr != nil {
+			prefix = "本机代理失败（" + vpnShortErr(proxyErr) + "）"
+		}
+		return nil, "", fmt.Errorf("%s；WARP: %s", prefix, vpnLogErr(werr))
 	}
-	return nodes, "WARP 隧道", nil
+	return nodes, viaRoute, nil
 }
 
 // fetchVPNGatePoolViaWARP builds a throwaway tunnel on the protocol the user
-// actually connects with and fetches through it. The endpoint preference is the
-// user's selected endpoint first, then the last endpoint that ever worked, then
-// the cached scan — a half-dead selection costs one handshake, not the fetch.
-func (u *natUI) fetchVPNGatePoolViaWARP() ([]vpnGateNode, error) {
+// actually connects with and fetches through it. When cached endpoints have
+// gone dead it rescans automatically, and if the chosen protocol itself is
+// blocked on this network it falls back to alternate WARP protocols (e.g. MASQUE).
+func (u *natUI) fetchVPNGatePoolViaWARP() ([]vpnGateNode, string, error) {
 	underlay := u.m.proto
 	if protoChained(underlay) {
 		underlay = protoAWG
@@ -1303,50 +1309,79 @@ func (u *natUI) fetchVPNGatePoolViaWARP() ([]vpnGateNode, error) {
 	default:
 		underlay = protoAWG
 	}
-	opts := defaultConnectOptions(underlay, false, false)
-	if err := ensureAccount(u.ctx, opts); err != nil {
-		return nil, err
-	}
-	var results []cachedEndpoint
-	if cs, ok := cachedScanFor(underlay, false); ok {
-		results = cs.Results
-	}
-	prefer := u.m.pin
-	if st, err := loadState(); err == nil && st.Endpoint != "" && prefer == "" && st.Proto == underlay {
-		prefer = st.Endpoint
-	}
-	run := mustParseProto(underlay)
-	if len(results) == 0 {
-		// No scan cache to fall back on. Try the remembered endpoint first —
-		// it is usually still alive and a scan costs one to two minutes — but a
-		// dead selection must not end the fetch: scan and try again instead.
-		quickErr := error(nil)
-		if prefer != "" || loadVPNGateUnderlay() != "" {
-			if nodes, err := fetchVPNGateNodesViaWARP(u.ctx, nil, run, prefer); err == nil {
-				return nodes, nil
-			} else {
-				quickErr = err
-				// Both remembered endpoints were just proved dead; spending a
-				// slot on them again after the scan would waste a third of the
-				// retry budget.
-				prefer = ""
-			}
-		}
-		u.sync(func() {
-			u.m.vpnPoolNote = tr("正在扫描 WARP 端点（约 1-2 分钟）…")
-			u.addLog(tr("正在扫描 WARP 端点（约 1-2 分钟）…"), false)
-			u.invalidate()
-		})
-		fresh, _, err := runCachedScan(u.ctx, opts)
-		if err != nil {
-			if quickErr != nil {
-				return nil, fmt.Errorf("%s；扫描: %s", vpnShortErr(quickErr), vpnShortErr(err))
-			}
+
+	tryProto := func(proto string, allowPin bool) ([]vpnGateNode, error) {
+		opts := defaultConnectOptions(proto, false, false)
+		opts.earlyStop = connectEarlyStop
+		if err := ensureAccount(u.ctx, opts); err != nil {
 			return nil, err
 		}
-		results = fresh
+		run := mustParseProto(proto)
+		var results []cachedEndpoint
+		if cs, ok := cachedScanFor(proto, false); ok {
+			results = cs.Results
+		}
+		prefer := ""
+		if allowPin {
+			prefer = u.m.pin
+			if st, err := loadState(); err == nil && st.Endpoint != "" && prefer == "" && st.Proto == proto {
+				prefer = st.Endpoint
+			}
+		}
+		if hasWorkingCachedEndpoint(results) || prefer != "" || (allowPin && loadVPNGateUnderlay() != "") {
+			if nodes, err := fetchVPNGateNodesViaWARP(u.ctx, results, run, prefer); err == nil {
+				return nodes, nil
+			}
+			// Cached/remembered endpoints all failed handshake or fetch: evict
+			// them and run a fast rescan instead of leaving refresh broken.
+			if allowPin {
+				clearVPNGateUnderlay()
+			}
+			invalidateScanCache(proto, false)
+		}
+		if u.ctx.Err() != nil {
+			return nil, u.ctx.Err()
+		}
+		u.sync(func() {
+			msg := fmt.Sprintf("缓存端点不可用，正在扫描 %s 端点…", protoLabel(proto))
+			u.m.vpnPoolNote = msg
+			u.addLog(msg, false)
+			u.invalidate()
+		})
+		opts.scanNow = true
+		fresh, _, err := runCachedScan(u.ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		if !hasWorkingCachedEndpoint(fresh) {
+			return nil, fmt.Errorf("%s 未扫到可用端点", protoLabel(proto))
+		}
+		return fetchVPNGateNodesViaWARP(u.ctx, fresh, run, "")
 	}
-	return fetchVPNGateNodesViaWARP(u.ctx, results, run, prefer)
+
+	nodes, lastErr := tryProto(underlay, true)
+	if lastErr == nil {
+		return nodes, "WARP 隧道", nil
+	}
+	if u.m.pin == "" {
+		for _, fbProto := range openvpnFallbackProtos(underlay) {
+			if u.ctx.Err() != nil {
+				return nil, "", u.ctx.Err()
+			}
+			u.sync(func() {
+				msg := fmt.Sprintf("%s 通道受阻，尝试经 %s 获取节点…", protoLabel(underlay), protoLabel(fbProto))
+				u.m.vpnPoolNote = msg
+				u.addLog(msg, false)
+				u.invalidate()
+			})
+			if fbNodes, ferr := tryProto(fbProto, false); ferr == nil {
+				return fbNodes, protoLabel(fbProto) + " 隧道", nil
+			} else {
+				lastErr = ferr
+			}
+		}
+	}
+	return nil, "", lastErr
 }
 
 // probeVPNGateLatencyAsync fills in the latency column when the pool came from

@@ -126,6 +126,10 @@ type options struct {
 	// repair leaves it off — a repair must restore the session, not shop for a
 	// faster relay — while every interactive connect turns it on.
 	openvpnSpeedGate bool
+	// baseFallbacks lists remaining base protocols runConnectOpenVPN may try
+	// when the primary underlay is blocked across all ports.
+	baseFallbacks    []string
+	baseFallbackInit bool
 	// openvpnAcceptSlow is set by the connect loop once the speed-retry budget
 	// is spent, so the next working relay is kept even if it is still slow:
 	// slow beats nothing.

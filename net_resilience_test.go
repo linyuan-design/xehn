@@ -136,3 +136,39 @@ func TestPhase2FallbackPlan(t *testing.T) {
 		t.Fatal("case 5c: sweepAll must not fallback")
 	}
 }
+
+func TestNeedsExtendedPortFallbackOnFakePrimaryHandshake(t *testing.T) {
+	awg := mustParseProto(protoAWG)
+	masque := mustParseProto(protoMASQUE)
+	empty := []endpointResult{{ok: false}}
+	working := []endpointResult{{ok: true, durable: true, endpoint: "8.35.211.32:878"}}
+
+	if !needsExtendedPortFallback(awg, options{}, []int{500, 1701, 4500}, empty) {
+		t.Fatal("expected extended port fallback when all primary ports failed data-plane check")
+	}
+	if needsExtendedPortFallback(awg, options{}, []int{854, 878}, empty) {
+		t.Fatal("must not loop if extended ports were already tried")
+	}
+	if needsExtendedPortFallback(awg, options{}, []int{500, 1701, 4500}, working) {
+		t.Fatal("must not probe extended ports when a working endpoint already exists")
+	}
+	if needsExtendedPortFallback(masque, options{}, []int{443}, empty) {
+		t.Fatal("MASQUE must not probe WG extended ports")
+	}
+}
+
+func TestOpenVPNFallbackProtosAndWorkingCacheCheck(t *testing.T) {
+	if got := openvpnFallbackProtos(protoAWG); !reflect.DeepEqual(got, []string{protoMASQUE, protoMASQUEH2}) {
+		t.Fatalf("awg fallbacks = %v, want [masque masque-h2]", got)
+	}
+	if got := openvpnFallbackProtos(protoMASQUE); !reflect.DeepEqual(got, []string{protoMASQUEH2, protoAWG}) {
+		t.Fatalf("masque fallbacks = %v, want [masque-h2 awg]", got)
+	}
+	deadOnly := []cachedEndpoint{{Endpoint: "8.39.125.69:2408", Working: false}}
+	if hasWorkingCachedEndpoint(deadOnly) {
+		t.Fatal("dead-only cache slice must report false")
+	}
+	if !hasWorkingCachedEndpoint(append(deadOnly, cachedEndpoint{Endpoint: "162.159.198.1:1701", Working: true})) {
+		t.Fatal("mixed cache slice with one working endpoint must report true")
+	}
+}

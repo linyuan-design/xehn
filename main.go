@@ -573,8 +573,49 @@ func runScan(ctx context.Context, opts options, run protoRun, ips []netip.Addr, 
 		results = retryResults
 	}
 
+	// ISPs often let standard WARP ports (2408/500/1701/4500) complete the
+	// initial WG/AWG handshake in Phase 1 while dropping real data in Phase 2,
+	// which previously skipped extendedWarpPorts altogether. Sweep the 50
+	// alternate ports whenever all primary ports fail data-plane verification.
+	if needsExtendedPortFallback(run, opts, ports, results) && ctx.Err() == nil {
+		stageMsg(fmt.Sprintf("[%s] 主端口均无法传输数据，正在探测 50 个冷门备用端口…", protoLabel(run.name)))
+		extOpen, eerr := probePorts(ctx, run, sampleAddrs(ips, portProbeSample), extendedWarpPorts, timeout, opts.tunnelParallel, emit, "Phase 1b: sweeping alternate WARP ports")
+		if eerr == nil && len(extOpen) > 0 {
+			if len(extOpen) > 4 {
+				extOpen = extOpen[:4]
+			}
+			extTimeout := max(timeout, scanRetryMinTimeout)
+			stageMsg(fmt.Sprintf("[%s] 发现可达备用端口 %v，正在验证数据面…", protoLabel(run.name), extOpen))
+			warpPorts = extOpen
+			if extResults, rerr := runPhase2(ctx, opts, run, ips, extOpen, extTimeout, emit); rerr == nil {
+				results = extResults
+			}
+		}
+	}
+
 	emit(doneMsg{})
 	return phaseResult{run, results}, nil
+}
+
+// needsExtendedPortFallback reports whether an empty Phase 2 sweep only tried
+// primary ports and should still probe extendedWarpPorts before giving up.
+func needsExtendedPortFallback(run protoRun, opts options, lastUsedPorts []int, results []endpointResult) bool {
+	if run.isMASQUE() || opts.port != 0 || opts.sweepPorts == sweepAll {
+		return false
+	}
+	if len(workingSorted(results)) > 0 {
+		return false
+	}
+	extSet := make(map[int]bool, len(extendedWarpPorts))
+	for _, p := range extendedWarpPorts {
+		extSet[p] = true
+	}
+	for _, p := range lastUsedPorts {
+		if extSet[p] {
+			return false
+		}
+	}
+	return true
 }
 
 const scanRetryMinTimeout = 4 * time.Second
