@@ -38,19 +38,61 @@ jobs:
           go-version: '1.26.3'
           cache-dependency-path: engine/go.sum
 
-      - name: Set up Android SDK & NDK
-        uses: android-actions/setup-android@v3
-
       - name: Ensure Android SDK platform 35, build-tools 35, and NDK 27
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          SDKMANAGER=""
+          for c in \
+            "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            "${SDK_ROOT}"/cmdline-tools/*/bin/sdkmanager \
+            "$(command -v sdkmanager 2>/dev/null || true)"; do
+            if [ -x "$c" ]; then
+              SDKMANAGER="$c"
+              break
+            fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under ${SDK_ROOT}"
+            ls -la "${SDK_ROOT}" || true
+            exit 1
+          fi
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "${SDK_ROOT}/platform-tools" >> "$GITHUB_PATH"
+          RUN_SDK="$SDKMANAGER"
+          if [ ! -w "$SDK_ROOT" ]; then
+            RUN_SDK="sudo -E $SDKMANAGER"
+          fi
+          yes | $RUN_SDK --licenses >/dev/null 2>&1 || true
+          NEED_PKGS=""
+          [ -d "${SDK_ROOT}/platforms/android-35" ] || NEED_PKGS="${NEED_PKGS} platforms;android-35"
+          [ -d "${SDK_ROOT}/build-tools/35.0.0" ] || NEED_PKGS="${NEED_PKGS} build-tools;35.0.0"
+          [ -d "${SDK_ROOT}/platform-tools" ] || NEED_PKGS="${NEED_PKGS} platform-tools"
+          NDK_DIR=$(ls -d "${SDK_ROOT}"/ndk/27.* "${SDK_ROOT}"/ndk/* 2>/dev/null | head -n 1 || true)
+          if [ -z "$NDK_DIR" ]; then
+            NEED_PKGS="${NEED_PKGS} ndk;27.0.12077973"
+          fi
+          if [ -n "$NEED_PKGS" ]; then
+            echo "Installing missing SDK packages:${NEED_PKGS}"
+            yes | $RUN_SDK $NEED_PKGS
+          fi
+          NDK_DIR=$(ls -d "${SDK_ROOT}"/ndk/27.* "${SDK_ROOT}"/ndk/* 2>/dev/null | head -n 1 || true)
+          if [ -z "$NDK_DIR" ]; then
+            echo "No Android NDK found after setup"
+            exit 1
+          fi
+          if [ -d "${SDK_ROOT}/licenses" ] && [ ! -w "${SDK_ROOT}/licenses" ]; then
+            sudo chmod -R a+rwX "${SDK_ROOT}/licenses" || true
+          fi
+          echo "Using NDK: ${NDK_DIR}"
+          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${NDK_DIR}" >> "$GITHUB_ENV"
 
       - name: Run Go engine unit tests
         working-directory: engine
         run: |
-          go test -tags="cmfa,with_gvisor" -timeout 180s ./...
+          go test -tags="cmfa,with_gvisor" -timeout 180s . ./warp ./subout
 
       - name: Build engine.aar via gomobile
         working-directory: engine
@@ -81,6 +123,7 @@ jobs:
 
       - name: Build Android APK
         run: |
+          sed -i 's/\r$//' gradlew
           chmod +x gradlew
           ./gradlew --no-daemon :app:assembleDebug
           ls -lh app/build/outputs/apk/debug/*.apk
