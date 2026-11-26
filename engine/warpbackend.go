@@ -143,6 +143,11 @@ func (b *warpBackend) RefreshVPNGateNodes(ctx context.Context, report func(strin
 	if handshake <= 0 {
 		handshake = defaultHandshakeTimeout
 	}
+	warp.SetCredsPaths(
+		filepath.Join(b.workDir, "masque.json"),
+		filepath.Join(b.workDir, "masque-outer.json"),
+		filepath.Join(b.workDir, "outer.json"),
+	)
 
 	// 抓取要起一条临时 WARP 隧道，而隧道需要账号。用户可能在「从没连过」的
 	// 状态下第一次打开节点选择器 —— 这时账号还没注册，直接 Dial 只会得到
@@ -171,18 +176,18 @@ func (b *warpBackend) RefreshVPNGateNodes(ctx context.Context, report func(strin
 	// 「每次刷新都重新注册一台设备」。刷新失败时只报告原因（协议回退已经在
 	// dialFetchUnderlay 里做过），把「换协议」和「换账号」彻底分开。
 	if err != nil {
+		b.forgetEndpoint("awg")
 		return 0, err
 	}
-	// 抓取用的临时隧道会把 awg 的成功端点记下来吗？没有 —— 它不落 lastGood，
-	// 这里也不必补记：它只是抓列表，不代表用户接下来要走这个端点。
-	c := &warp.VPNGateCache{FetchedAt: time.Now().UnixMilli(), Nodes: nodes}
+	prev := warp.LoadVPNGateCache(b.vpnGatePath())
+	c := warp.MergeVPNGateCache(prev, nodes, time.Now())
 	if err := warp.SaveVPNGateCache(b.vpnGatePath(), c); err != nil {
-		return len(nodes), fmt.Errorf("节点已抓取（%d 个）但写缓存失败: %w", len(nodes), err)
+		return len(c.Nodes), fmt.Errorf("节点已抓取（%d 个）但写缓存失败: %w", len(c.Nodes), err)
 	}
 	b.mu.Lock()
 	b.vpnGate = c
 	b.mu.Unlock()
-	return len(nodes), nil
+	return len(c.Nodes), nil
 }
 
 // PrepareAccounts 在建系统 VPN **之前**把账号准备好（必要时注册）。
@@ -218,6 +223,11 @@ func (b *warpBackend) PrepareAccounts(ctx context.Context, proto string, report 
 		if err := warp.EnsureMasqueAccount(ctx, report); err != nil {
 			return fmt.Errorf("注册 MASQUE 账号失败：%w", err)
 		}
+	} else if _, serr := os.Stat(filepath.Join(b.workDir, "masque.json")); serr != nil {
+		// 顺手在建系统 VPN 前预备好 MASQUE 兜底凭据（非阻塞容错），这样 AWG 被封时可无缝切换。
+		mctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		_ = warp.EnsureMasqueAccount(mctx, func(string) {})
+		cancel()
 	}
 	return nil
 }
@@ -329,7 +339,11 @@ func (b *warpBackend) connectOpenVPN(
 		}
 		lastErr = err
 		report(fmt.Sprintf("节点 %s 失败：%v", id, err))
-		b.markOpenVPNFailed(id)
+		if strings.Contains(err.Error(), "WARP 上游") {
+			b.forgetEndpoint(req.Proto)
+		} else {
+			b.markOpenVPNFailed(id)
+		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("没有任何可用节点配置")

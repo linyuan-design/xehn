@@ -39,9 +39,11 @@ import (
 // vpnGateAPI 是 VPN Gate 的公开节点接口。HTTPS 优先，明文只作回退。
 const vpnGateAPI = "https://www.vpngate.net/api/iphone/"
 
-// vpnGateMaxNodes 是单次最多保留的节点数。接口通常给 60–120 条，全留；
-// 上限只是防止某天接口返回异常大的列表把内存/APK 私有目录撑爆。
-const vpnGateMaxNodes = 200
+// vpnGateMaxNodes 是合并近期切片后最多保留的节点数。
+const (
+	vpnGateMaxNodes = 400
+	vpnGateMergeTTL = 2 * time.Hour
+)
 
 // VPNGateNode 是一个候选节点。
 //
@@ -72,8 +74,11 @@ type VPNGateNode struct {
 	// 都命中 PacketStream 共享代理，所以这个标记要展示，但不能据此隐藏节点）。
 	Shared bool `json:"shared"`
 	// ISP/AS 是分类依据，也一并给 UI（用户想看"为什么是家宽"）。
-	ISP string `json:"isp"`
-	AS  string `json:"as"`
+	ISP    string `json:"isp"`
+	AS     string `json:"as"`
+	SeenAt int64  `json:"seenAt,omitempty"`
+	// Stale 表示该节点来自上一批缓存切片、但未出现在最新一次抓取中（保留稀有地区兜底，但严格排在实时在线节点后面）。
+	Stale bool `json:"stale,omitempty"`
 
 	Config string `json:"-"`
 }
@@ -616,18 +621,128 @@ func FetchVPNGate(ctx context.Context, o VPNGateFetchOptions) ([]VPNGateNode, er
 
 	// 实测 TCP 延迟（只对 tcp 节点；udp 节点保留自报 ping）。
 	probeLatency(ctx, stack, nodes, 8)
+	SortVPNGateNodes(nodes)
+	return nodes, nil
+}
+
+// VPNGateQualityScore 综合带宽、在线会话人数与延迟估算单用户可用质量：
+// 惩罚 60 人以上拥挤节点与 0 会话半死节点，对齐桌面版排序。
+func VPNGateQualityScore(n VPNGateNode) int64 {
+	if n.SpeedBps <= 0 {
+		return 0
+	}
+	sessions := n.Sessions
+	if sessions < 0 {
+		sessions = 0
+	}
+	perUser := int64(n.SpeedBps) / int64(sessions+5)
+	if sessions == 0 {
+		perUser /= 4
+	} else if sessions >= 60 {
+		perUser /= 2
+	}
+	lat := int64(n.LatencyMS)
+	if lat <= 0 {
+		lat = int64(n.PingMS)
+	}
+	if lat <= 0 {
+		lat = 100
+	}
+	if lat < 30 {
+		lat = 30
+	}
+	return perUser / (lat + 120)
+}
+
+func classOrderRank(cls string) int {
+	switch cls {
+	case "residential":
+		return 0
+	case "unknown", "degraded":
+		return 1
+	default:
+		return 2
+	}
+}
+
+// SortVPNGateNodes 统一按「实时在线(!Stale) → 家宽优先 → TCP 优先 → 实测可达 → 单用户带宽质量 → 延迟」排序。
+func SortVPNGateNodes(nodes []VPNGateNode) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		a, b := nodes[i], nodes[j]
-		// 有实测用实测；没有实测的排在后面，而不是拿自报 ping 冒充。
+		if a.Stale != b.Stale {
+			return !a.Stale
+		}
+		if ra, rb := classOrderRank(a.Class), classOrderRank(b.Class); ra != rb {
+			return ra < rb
+		}
+		if (a.Proto == "tcp") != (b.Proto == "tcp") {
+			return a.Proto == "tcp"
+		}
 		if (a.LatencyMS > 0) != (b.LatencyMS > 0) {
 			return a.LatencyMS > 0
 		}
-		if a.LatencyMS != b.LatencyMS {
+		qa, qb := VPNGateQualityScore(a), VPNGateQualityScore(b)
+		if qa > 0 && qb > 0 && qa != qb {
+			return qa > qb
+		}
+		if a.LatencyMS > 0 && a.LatencyMS != b.LatencyMS {
 			return a.LatencyMS < b.LatencyMS
+		}
+		if a.PingMS > 0 && b.PingMS > 0 && a.PingMS != b.PingMS {
+			return a.PingMS < b.PingMS
 		}
 		return a.SpeedBps > b.SpeedBps
 	})
-	return nodes, nil
+}
+
+// MergeVPNGateCache 将新抓到的实时节点与 2 小时内未过期的旧切片合并：
+// 实时节点 Stale=false 永远排在前面；旧切片消失节点标 Stale=true 仅作稀有国家兜底。
+func MergeVPNGateCache(existing *VPNGateCache, fresh []VPNGateNode, now time.Time) *VPNGateCache {
+	nowMS := now.UnixMilli()
+	seen := make(map[string]bool, len(fresh))
+	merged := make([]VPNGateNode, 0, len(fresh)+64)
+	for _, n := range fresh {
+		if n.ID == "" || seen[n.ID] {
+			continue
+		}
+		seen[n.ID] = true
+		n.SeenAt = nowMS
+		n.Stale = false
+		merged = append(merged, n)
+	}
+	if existing != nil {
+		var kept []VPNGateNode
+		fallbackAt := existing.FetchedAt
+		ttlMS := vpnGateMergeTTL.Milliseconds()
+		for _, n := range existing.Nodes {
+			if n.ID == "" || seen[n.ID] || n.Config == "" {
+				continue
+			}
+			at := n.SeenAt
+			if at <= 0 {
+				at = fallbackAt
+			}
+			if at <= 0 || nowMS-at >= ttlMS {
+				continue
+			}
+			seen[n.ID] = true
+			n.SeenAt = at
+			n.Stale = true
+			kept = append(kept, n)
+		}
+		sort.SliceStable(kept, func(i, j int) bool {
+			if kept[i].SeenAt != kept[j].SeenAt {
+				return kept[i].SeenAt > kept[j].SeenAt
+			}
+			return VPNGateQualityScore(kept[i]) > VPNGateQualityScore(kept[j])
+		})
+		merged = append(merged, kept...)
+	}
+	if len(merged) > vpnGateMaxNodes {
+		merged = merged[:vpnGateMaxNodes]
+	}
+	SortVPNGateNodes(merged)
+	return &VPNGateCache{FetchedAt: nowMS, Nodes: merged}
 }
 
 // fetchVPNGateTextWithFallback 返回 CSV 与（可能为 nil 的）临时隧道。
@@ -690,10 +805,17 @@ func dialFetchUnderlay(ctx context.Context, o VPNGateFetchOptions) (*Session, er
 		if i > 0 {
 			o.report(fmt.Sprintf("换 %s 再试一次上游…", proto))
 		}
+		if isMasqueProto(proto) {
+			_ = EnsureMasqueAccount(ctx, o.Report)
+		}
+		prefer := ""
+		if proto == o.UnderlayProto {
+			prefer = o.UnderlayPrefer
+		}
 		sess, err := Dial(ctx, Options{
 			Proto:            proto,
 			Endpoint:         o.UnderlayEndpoint,
-			Prefer:           o.UnderlayPrefer,
+			Prefer:           prefer,
 			IPv6:             o.IPv6,
 			Sample:           2,
 			HandshakeTimeout: handshake,
@@ -906,6 +1028,9 @@ func LoadVPNGateCache(path string) *VPNGateCache {
 			for i := range c.Nodes {
 				if cfg, ok := cfgs[c.Nodes[i].ID]; ok {
 					c.Nodes[i].Config = cfg
+				}
+				if c.FetchedAt > 0 && c.Nodes[i].SeenAt > 0 && c.FetchedAt-c.Nodes[i].SeenAt > 60_000 {
+					c.Nodes[i].Stale = true
 				}
 			}
 		}

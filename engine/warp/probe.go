@@ -137,6 +137,70 @@ func ProbeLatency(ctx context.Context, timeout time.Duration) (int64, bool) {
 	return time.Since(start).Milliseconds(), true
 }
 
+// ProbeSystemThroughput downloads wantBytes over the active system VPN tunnel
+// and returns the achieved bytes/sec, catching half-dead stalled exits.
+func ProbeSystemThroughput(ctx context.Context, wantBytes int, timeout time.Duration) (int64, error) {
+	if wantBytes <= 0 {
+		wantBytes = 64 * 1024
+	}
+	if timeout <= 0 {
+		timeout = 6 * time.Second
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	u := "https://speed.cloudflare.com/__down?bytes=" + strconvItoa(wantBytes)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Referer", metaReferer)
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	start := time.Now()
+	buf := make([]byte, 16*1024)
+	var got int64
+	for got < int64(wantBytes) {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			got += int64(n)
+		}
+		if rerr != nil {
+			if got >= int64(wantBytes) {
+				break
+			}
+			el := time.Since(start).Seconds()
+			var bps int64
+			if el > 0 && got > 0 {
+				bps = int64(float64(got) / el)
+			}
+			return bps, rerr
+		}
+	}
+	el := time.Since(start).Seconds()
+	if el <= 0 {
+		el = 0.001
+	}
+	return int64(float64(got) / el), nil
+}
+
+func strconvItoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var digits [20]byte
+	i := len(digits)
+	for n > 0 {
+		i--
+		digits[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(digits[i:])
+}
+
 // Counters reports cumulative (tx, rx) bytes of the data plane since the session
 // was created. Zeros when the tunnel has no OS device to count.
 func (s *Session) Counters() (tx, rx uint64) {

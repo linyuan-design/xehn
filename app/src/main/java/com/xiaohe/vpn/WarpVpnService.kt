@@ -213,7 +213,8 @@ class WarpVpnService : VpnService() {
          * 慢总比连不上强：换到第 3 个还是慢，说明这段网络里 VPN Gate 就这样，
          * 再换只是把用户的等待时间翻倍。
          */
-        private const val OPENVPN_SPEED_RETRIES = 2
+        private const val OPENVPN_SPEED_RETRIES = 1
+        private const val OPENVPN_SPEED_GATE_DEADLINE_MS = 45_000L
 
         /**
          * 等一次连接出结果的上限。
@@ -266,6 +267,10 @@ class WarpVpnService : VpnService() {
      * 把进程搞死的」—— 同一次连接里每换一个节点就会重新 establish 一次。
      */
     private var tunEstablishCount = 0
+
+    /** 当前已连通的 OpenVPN 出口节点 ID，供守护自动重连时拉黑异常节点并切到下一个。 */
+    @Volatile
+    private var activeOpenVpnNodeId: String = ""
 
     /** 自动重连用的协程作用域（随服务销毁回收）。 */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -335,6 +340,7 @@ class WarpVpnService : VpnService() {
         }
         val target = intent.getStringExtra(EXTRA_PROTO) ?: SettingsStore.load(this).proto
         EngineBridge.note("[vpn] 协议热切换 → $target")
+        activeOpenVpnNodeId = ""
         connectJob?.cancel()
         connectJob = null
         runCatching { e.disconnect() }
@@ -471,7 +477,8 @@ class WarpVpnService : VpnService() {
         //       系统 tun → mihomo → 订阅节点 → dialer-proxy(本地 SOCKS) → WARP → 节点
         //     所以这里只需把 fd 和「国家/订阅地址/物理网卡」交给引擎，剩下的它自己做。
         if (s.subExit && !psiphon && !openvpn) {
-            connectJob?.cancel()
+            activeOpenVpnNodeId = ""
+        connectJob?.cancel()
             EngineBridge.note(
                 "[subout] 订阅出口：国家=${s.subCountry}，订阅=" +
                     (if (s.subCustomURL.isBlank()) "内置分片" else s.subCustomURL)
@@ -530,6 +537,7 @@ class WarpVpnService : VpnService() {
         //    永远走不到第二轮 —— 那三档「自动换下一批」其实从来没生效过。
         //    现在改成「发起 → 等结果 → 按结果决定」，顺便把「节点通了但太慢」
         //    也当成一种可轮换的结果（见 connectLoop）。
+        activeOpenVpnNodeId = ""
         connectJob?.cancel()
         connectJob = scope.launch {
             // 必须在协程里接住所有异常：gomobile 的 Java 代理在状态机拒绝时抛
@@ -609,6 +617,7 @@ class WarpVpnService : VpnService() {
         }
 
         val pinnedId = s.openvpnNodeId
+        val connectStartedMs = System.currentTimeMillis()
         // 本次点击里已经试过的节点（握手失败的、太慢的）。
         // 一次点击不再把一堆节点塞给引擎，而是「一次只试一个」：引擎拿到几个
         // 候选就会在一次 connect 里连续 establish 几次系统 VPN，而真机日志显示
@@ -698,6 +707,7 @@ class WarpVpnService : VpnService() {
             // VPN Gate 的出口就是节点自己的公网 IP，命中率很高。
             val exitIp = EngineBridge.state.value.exitIp
             val node = nodes.firstOrNull { it.ip == exitIp } ?: first
+            activeOpenVpnNodeId = node.id
             if (node.id != first.id) {
                 EngineBridge.note(
                     "[vpn] 实际出口 $exitIp 对应节点 ${nodeSlotLabel(nodes, node)}" +
@@ -718,6 +728,10 @@ class WarpVpnService : VpnService() {
             )
 
             if (bps >= OPENVPN_MIN_BPS) return
+            if (System.currentTimeMillis() - connectStartedMs >= OPENVPN_SPEED_GATE_DEADLINE_MS) {
+                EngineBridge.note("[vpn] 连接耗时已超过 45s，当前节点已验证可用，直接保留连接")
+                return
+            }
             if (pinnedId.isNotEmpty() && node.id == pinnedId) {
                 EngineBridge.note("[vpn] 当前是手动钉死的节点，速度偏慢也保留（只记录速度）")
                 return
@@ -1655,8 +1669,19 @@ class WarpVpnService : VpnService() {
                     break
                 }
                 attempts++
-                EngineBridge.note("[vpn] 出口长时间无数据，自动重连（第 $attempts 次）")
                 val s = SettingsStore.load(this@WarpVpnService)
+                val badNodeId = activeOpenVpnNodeId
+                if (s.openvpn && badNodeId.isNotEmpty() && s.openvpnNodeId.isEmpty()) {
+                    NodeProbeStore.rememberAll(
+                        this@WarpVpnService,
+                        listOf(badNodeId to NodeProbeStore.Probe(0, false, 0, now)),
+                    )
+                    EngineBridge.peek()?.let { runCatching { it.markOpenVPNNodeFailed(badNodeId) } }
+                    EngineBridge.note("[守护] 节点 $badNodeId 断流或半死卡顿，正在自动切换到下一个可用节点（第 $attempts/$RECOVER_MAX 次）…")
+                } else {
+                    EngineBridge.note("[守护] 出口断流或半死卡顿，正在自动重连（第 $attempts/$RECOVER_MAX 次）…")
+                }
+                activeOpenVpnNodeId = ""
                 EngineBridge.peek()?.let { e ->
                     // 先断开：关掉 tun，系统 VPN 会短暂消失；紧接着 establish 新的。
                     // 端点缓存由引擎在 Connect 开头清掉（不再优先试死掉的那个）。
@@ -1707,6 +1732,7 @@ class WarpVpnService : VpnService() {
         EngineBridge.note(CrashGuard.SHUTDOWN_MARK + "（服务停止，OpenVPN establish $tunEstablishCount 次）")
         // 先掐掉还在「等连接结果 / 测速」的那一轮，否则它会在断开之后再
         // 发起一次 connect（表现就是「点了断开又自己连上」）。
+        activeOpenVpnNodeId = ""
         connectJob?.cancel()
         connectJob = null
         watchdog?.cancel()

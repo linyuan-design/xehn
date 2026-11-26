@@ -472,13 +472,14 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	// gVisor 用户态 TCP），但 2026-10-22 真机实测：这条网络里直连节点的 TCP
 	// 全部 i/o timeout，连接失败**全部**由它引入，而直连成功的那几个也过不了数据。
 	// 所以整条直连分支（含设置里的「连节点方式」）在 0.2.3 移除，不再作为选项。
+	attemptStarted := time.Now()
 	under, client, push, err := dialOpenVPNUpstream(ctx, o, cfgText, clientCfg, nodeAddr)
 	if err != nil {
-		// 同一节点重试一次：VPN Gate 的 TCP 握手会抖（真机日志里 98 个节点有 36 个
-		// 是 `hard reset response` / `EOF` 这类瞬时失败，同一个节点下一次就过）。
-		// 用户看到的却是「固定节点连不上」——重试一次能救回相当一部分。
-		o.report(fmt.Sprintf("节点 %s 第一次握手失败（%v），重试一次…", nodeAddr, err))
-		under, client, push, err = dialOpenVPNUpstream(ctx, o, cfgText, clientCfg, nodeAddr)
+		// 仅对快速瞬时错误（如 TCP reset / EOF）同节点重试一次；已经等满握手超时的离线死节点不再翻倍空等。
+		if !isHandshakeTimeoutErr(err) && time.Since(attemptStarted) < 8*time.Second && ctx.Err() == nil {
+			o.report(fmt.Sprintf("节点 %s 第一次握手瞬时中断（%v），重试一次…", nodeAddr, err))
+			under, client, push, err = dialOpenVPNUpstream(ctx, o, cfgText, clientCfg, nodeAddr)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("连接 OpenVPN 节点 %s 失败：%w", nodeAddr, err)
 		}
@@ -593,34 +594,116 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 // 一条上游本来就是纯用户态 netstack，谁都能往上拨。
 //
 // 调用方负责 Close 返回的 Session。
+// UnderlayFallbacks 返回当首选基础协议在当前网络整体不可用时的自动兜底顺序。
+func UnderlayFallbacks(primary string) []string {
+	switch primary {
+	case protoAWG:
+		return []string{protoAWG, protoMASQUE, protoMASQUEH2}
+	case protoWG:
+		return []string{protoWG, protoAWG, protoMASQUE, protoMASQUEH2}
+	case protoMASQUE:
+		return []string{protoMASQUE, protoMASQUEH2, protoAWG}
+	case protoMASQUEH2:
+		return []string{protoMASQUEH2, protoMASQUE, protoAWG}
+	default:
+		return []string{primary, protoMASQUE, protoMASQUEH2}
+	}
+}
+
+func isHandshakeTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded")
+}
+
 func OpenUnderlay(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	if o.UnderlayProto == "" {
 		o.UnderlayProto = protoAWG
 	}
+	protos := []string{o.UnderlayProto}
+	if o.UnderlayEndpoint == "" {
+		protos = UnderlayFallbacks(o.UnderlayProto)
+	}
+	totalCap := o.Budget
+	if totalCap < 60*time.Second {
+		totalCap = 60 * time.Second
+	}
 	savedTunFD := tunFD
 	tunFD = 0
-	sess, err := Dial(ctx, Options{
-		Proto:            o.UnderlayProto,
-		Endpoint:         o.UnderlayEndpoint,
-		Prefer:           o.UnderlayPrefer,
-		IPv6:             o.IPv6,
-		Sample:           2,
-		HandshakeTimeout: o.HandshakeTimeout,
-		VerifyTimeout:    o.VerifyTimeout,
-		Budget:           o.Budget,
-		NoHedge:          true,
-		Report:           o.Report,
-	})
-	tunFD = savedTunFD
-	if err != nil {
-		return nil, fmt.Errorf("WARP 上游（%s）建立失败: %w", o.UnderlayProto, err)
+	defer func() { tunFD = savedTunFD }()
+
+	var lastErr error
+	started := time.Now()
+	for i, proto := range protos {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		rem := totalCap - time.Since(started)
+		if dl, ok := ctx.Deadline(); ok {
+			if d := time.Until(dl); d < rem {
+				rem = d
+			}
+		}
+		if rem < 5*time.Second {
+			break
+		}
+		budget := 16 * time.Second
+		if i == 0 {
+			budget = 28 * time.Second
+			if len(protos) == 1 && o.Budget > 0 {
+				budget = o.Budget
+			}
+		}
+		if budget > rem {
+			budget = rem
+		}
+		if i > 0 {
+			o.report(fmt.Sprintf("%s 上游受阻，自动切换 %s 底座重试…", protos[i-1], proto))
+		}
+		if isMasqueProto(proto) {
+			if merr := EnsureMasqueAccount(ctx, o.Report); merr != nil {
+				lastErr = merr
+				o.report(fmt.Sprintf("%s 凭据准备失败：%v", proto, merr))
+				continue
+			}
+		}
+		prefer := ""
+		if proto == o.UnderlayProto {
+			prefer = o.UnderlayPrefer
+		}
+		sess, err := Dial(ctx, Options{
+			Proto:            proto,
+			Endpoint:         o.UnderlayEndpoint,
+			Prefer:           prefer,
+			IPv6:             o.IPv6,
+			Sample:           2,
+			HandshakeTimeout: o.HandshakeTimeout,
+			VerifyTimeout:    o.VerifyTimeout,
+			Budget:           budget,
+			NoHedge:          true,
+			Report:           o.Report,
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if sess.tn.stack() == nil {
+			sess.Close()
+			lastErr = errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
+			continue
+		}
+		o.report(fmt.Sprintf("上游就绪（%s 出口 %s），经 WARP 拨节点…", proto, sess.ExitIP))
+		return sess, nil
 	}
-	if sess.tn.stack() == nil {
-		sess.Close()
-		return nil, errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
+	if lastErr == nil {
+		lastErr = errors.New("未找到可用上游端点")
 	}
-	o.report(fmt.Sprintf("上游就绪（%s 出口 %s），经 WARP 拨节点…", o.UnderlayProto, sess.ExitIP))
-	return sess, nil
+	return nil, fmt.Errorf("WARP 上游（%s）建立失败: %w", o.UnderlayProto, lastErr)
 }
 
 // ProbeOpenVPNHandshake 只做「经已有上游拨节点 + OpenVPN 握手」，返回握手耗时。
@@ -1053,14 +1136,16 @@ func dialThroughStack(ctx context.Context, stack *ipStack, proto, addr string, t
 	}
 }
 
-// handshakeWindow 给单次 OpenVPN 握手一个上限。VPN Gate 节点的握手实测
-// 4.8–12.5s，给 25s 既不会把慢节点误杀，也不会让界面无休止转。
+// handshakeWindow 收敛单次 OpenVPN 握手上限（默认 14s，最高 16s），避免死节点空等 25s。
 func handshakeWindow(d time.Duration) time.Duration {
 	if d <= 0 {
-		return 25 * time.Second
+		return 14 * time.Second
 	}
 	if d < 10*time.Second {
 		return 10 * time.Second
+	}
+	if d*2 > 16*time.Second {
+		return 16 * time.Second
 	}
 	return d * 2
 }

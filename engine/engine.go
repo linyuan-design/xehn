@@ -44,7 +44,7 @@ import (
 // Keep the doc comments of *bound* symbols ASCII: gomobile copies them into the
 // generated Java, and javac on a Chinese Windows defaults to GBK, which turns
 // any non-ASCII byte into "unmappable character" and fails the whole bind.
-const Version = "0.2.0-android-p1"
+const Version = "0.2.58"
 
 // ErrNotWired is returned by the default backend: the UI and the state machine
 // are in place, the warpscout engine has not been moved in yet.
@@ -256,6 +256,16 @@ func (e *Engine) SetTunProvider(p TunProvider) {
 		return fd, nil
 	})
 	e.sess.logf("[engine] 已安装 OpenVPN / Psiphon 建 tun 回调")
+}
+
+// MarkOpenVPNNodeFailed records one VPN Gate node ID in the 10-minute failure
+// memory so watchdog reconnects rotate to a fresh relay instead of retrying the
+// dead or degraded one.
+func (e *Engine) MarkOpenVPNNodeFailed(id string) {
+	if wb := e.warpBackendOf(); wb != nil && strings.TrimSpace(id) != "" {
+		wb.markOpenVPNFailed(strings.TrimSpace(id))
+		e.sess.logf("[守护] 已将异常出口节点 %s 加入 10 分钟跳过列表", id)
+	}
 }
 
 // SetOpenVPNExit selects the OpenVPN nodes to try, in order, as the final exit.
@@ -770,10 +780,9 @@ func (e *Engine) startStats() {
 	//   3) 只要 tun 还在进出字节（flowed），探测失败就不计数 —— 那是探测包
 	//      被丢（DNS/ICMP/端口被拦都会这样），不是隧道死了。
 	const (
-		probeTimeout   = 5 * time.Second
-		probeGrace     = 12 * time.Second
-		probeFailLimit = 5
-		probeFlowSlack = 512
+		probeTimeout       = 5 * time.Second
+		probeGrace         = 12 * time.Second
+		speedCheckInterval = 45 * time.Second
 	)
 	started := time.Now()
 	go func() {
@@ -782,15 +791,10 @@ func (e *Engine) startStats() {
 		var lastTx, lastRx uint64
 		var lastAt time.Time
 		var latency int64
-		// 连续探测失败计数 / 是否已经就这次故障写过日志（只在状态翻转时写一行，
-		// 免得日志被刷屏）。
-		var probeFails int
-		var probeWarned bool
+		guard := newAndroidHealthGuard(started)
 		for {
 			select {
 			case <-stop:
-				// 断开后清零：界面上「共 0 B」才是真的没在传，留着上次会话的
-				// 累计值会让人以为还在跑。
 				e.sess.setStats(0, 0, 0, 0, 0)
 				return
 			case <-ticker.C:
@@ -804,45 +808,178 @@ func (e *Engine) startStats() {
 					down = int64(float64(rx-lastRx) / secs)
 				}
 			}
-			// 这一轮里数据面有没有真的动过（两个方向都算）。
-			flowed := (tx-lastTx)+(rx-lastRx) > probeFlowSlack
+			// Healthy user traffic requires BOTH directions advancing at usable
+			// speed; one-way outbound TCP SYN retransmits on a dead tunnel must
+			// never mask probe failures.
+			bidirActive := !lastAt.IsZero() && tx > lastTx && rx > lastRx && (up+down) >= androidActiveFlowBps
 			lastTx, lastRx, lastAt = tx, rx, now
 
 			if throughVPN && now.Sub(started) >= probeGrace {
-				if ms, ok := warp.ProbeLatency(context.Background(), probeTimeout); ok {
+				ms, ok := warp.ProbeLatency(context.Background(), probeTimeout)
+				if ok {
 					latency = ms
-					probeFails = 0
-					if probeWarned {
-						probeWarned = false
-						e.sess.logf("[engine] 隧道探测恢复")
+				}
+				act := guard.observe(now, ok, ms, bidirActive)
+				if !act.recoverNow && guard.shouldProbeSpeed(now, ok, ms, bidirActive, speedCheckInterval) {
+					bps, serr := warp.ProbeSystemThroughput(context.Background(), 64*1024, 6*time.Second)
+					sAct := guard.observeSpeed(time.Now(), bps, serr)
+					if sAct.logLine != "" {
+						act.logLine = sAct.logLine
 					}
-					// 隧道自己缓过来了：撤掉「等重连」标记，别让看门狗白断开一次。
+					if sAct.recoverNow {
+						act.recoverNow = true
+					}
+				}
+				if act.logLine != "" {
+					e.sess.logf("[守护] %s", act.logLine)
+				}
+				if act.recovered {
 					e.sess.clearNeedsRecover()
-				} else if flowed {
-					// 探测失败但隧道在传数据：探针被丢，不是出口不可达。
-					probeFails = 0
-				} else {
-					// 「已连接但上不了网」最难查的就是分不清「隧道从没通过」和
-					// 「通了一会儿被切断」。连续失败且完全没有数据流动才写一行。
-					probeFails++
-					if probeFails >= probeFailLimit {
-						// 判定为断：清掉延迟，界面上显示「—」，别留一个早就
-						// 过期的数字骗人。
-						latency = 0
-						if !probeWarned {
-							probeWarned = true
-							e.sess.logf("[engine] 隧道连续 %d 次探测失败且无数据流动：出口已不可达（可能被切断）", probeFails)
-						}
-						// 只写日志不够：界面会一直显示「已连接」，而实际上一个网页
-						// 都打不开（用户实测就是这样，39 分钟零流量）。标记出来，
-						// 由 WarpVpnService 的看门狗断开并**换端点**重连。
-						e.sess.markNeedsRecover()
-					}
+				}
+				if act.recoverNow {
+					latency = 0
+					e.sess.markNeedsRecover()
 				}
 			}
 			e.sess.setStats(latency, up, down, int64(tx), int64(rx))
 		}
 	}()
+}
+
+const (
+	androidActiveFlowBps = 32 * 1024
+	androidMinUsableBps  = 30 * 1024
+	androidBadLimit      = 6
+	androidSlowLatencyMS = 3000
+)
+
+type androidGuardAction struct {
+	recoverNow bool
+	recovered  bool
+	logLine    string
+}
+
+type androidHealthGuard struct {
+	badPoints   int
+	slowStreak  int
+	hadTrouble  bool
+	warnedDead  bool
+	lastSpeedAt time.Time
+}
+
+func newAndroidHealthGuard(now time.Time) *androidHealthGuard {
+	return &androidHealthGuard{lastSpeedAt: now}
+}
+
+func (g *androidHealthGuard) observe(now time.Time, ok bool, ms int64, bidirActive bool) androidGuardAction {
+	if bidirActive {
+		wasBad := g.hadTrouble && g.badPoints <= 2 && g.slowStreak == 0
+		if g.badPoints >= 2 {
+			g.badPoints -= 2
+		} else {
+			g.badPoints = 0
+		}
+		g.slowStreak = 0
+		if g.badPoints == 0 && g.hadTrouble {
+			g.hadTrouble = false
+			g.warnedDead = false
+			if wasBad {
+				return androidGuardAction{recovered: true, logLine: "隧道流量已恢复正常"}
+			}
+			return androidGuardAction{recovered: true}
+		}
+		return androidGuardAction{recovered: g.badPoints == 0}
+	}
+	if !ok {
+		g.hadTrouble = true
+		g.badPoints += 2
+		if g.badPoints >= androidBadLimit {
+			g.badPoints = 0
+			g.slowStreak = 0
+			line := ""
+			if !g.warnedDead {
+				g.warnedDead = true
+				line = "隧道探测持续失败，正在触发自动切换节点…"
+			}
+			return androidGuardAction{recoverNow: true, logLine: line}
+		}
+		return androidGuardAction{
+			logLine: fmt.Sprintf("数据面探测超时（异常分 %d/%d）", g.badPoints, androidBadLimit),
+		}
+	}
+	if ms >= androidSlowLatencyMS {
+		g.hadTrouble = true
+		g.badPoints++
+		if g.badPoints >= androidBadLimit {
+			g.badPoints = 0
+			g.slowStreak = 0
+			line := ""
+			if !g.warnedDead {
+				g.warnedDead = true
+				line = fmt.Sprintf("隧道持续严重高延迟（%dms），正在自动切换节点…", ms)
+			}
+			return androidGuardAction{recoverNow: true, logLine: line}
+		}
+		return androidGuardAction{
+			logLine: fmt.Sprintf("隧道响应偏慢（%dms，异常分 %d/%d）", ms, g.badPoints, androidBadLimit),
+		}
+	}
+	if g.badPoints > 0 {
+		g.badPoints--
+	}
+	if g.badPoints == 0 && g.slowStreak == 0 && g.hadTrouble {
+		g.hadTrouble = false
+		g.warnedDead = false
+		return androidGuardAction{recovered: true, logLine: "隧道探测已恢复"}
+	}
+	return androidGuardAction{recovered: g.badPoints == 0}
+}
+
+func (g *androidHealthGuard) shouldProbeSpeed(now time.Time, ok bool, ms int64, bidirActive bool, interval time.Duration) bool {
+	if bidirActive {
+		return false
+	}
+	if g.slowStreak > 0 {
+		return now.Sub(g.lastSpeedAt) >= 12*time.Second
+	}
+	if (!ok || ms >= 2200 || g.badPoints >= 2) && now.Sub(g.lastSpeedAt) >= interval {
+		return true
+	}
+	return false
+}
+
+func (g *androidHealthGuard) observeSpeed(now time.Time, bps int64, err error) androidGuardAction {
+	g.lastSpeedAt = now
+	if err != nil || bps < androidMinUsableBps {
+		g.hadTrouble = true
+		g.slowStreak++
+		if g.slowStreak >= 2 {
+			g.badPoints = 0
+			g.slowStreak = 0
+			g.warnedDead = true
+			if err != nil {
+				return androidGuardAction{recoverNow: true, logLine: "隧道半死断流（连续 2 次吞吐复核失败），正在自动切换可用节点…"}
+			}
+			return androidGuardAction{
+				recoverNow: true,
+				logLine:    fmt.Sprintf("隧道半死卡顿（实测 ≈ %d KB/s < %d KB/s），正在自动切换可用节点…", bps/1024, androidMinUsableBps/1024),
+			}
+		}
+		if err != nil {
+			return androidGuardAction{logLine: "隧道吞吐复核超时 (1/2)，即将复核…"}
+		}
+		return androidGuardAction{
+			logLine: fmt.Sprintf("隧道速率过低 (1/2)：实测 ≈ %d KB/s，即将复核…", bps/1024),
+		}
+	}
+	wasSlow := g.slowStreak > 0
+	g.slowStreak = 0
+	if wasSlow && g.badPoints == 0 {
+		g.hadTrouble = false
+		g.warnedDead = false
+		return androidGuardAction{recovered: true, logLine: fmt.Sprintf("隧道速率已恢复（≈ %d KB/s）", bps/1024)}
+	}
+	return androidGuardAction{}
 }
 
 func (e *Engine) stopStats() {

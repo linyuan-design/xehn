@@ -162,7 +162,9 @@ func (o *Options) fill() {
 		o.Budget = 45 * time.Second
 	}
 	if len(o.Ports) == 0 {
-		o.Ports = []int{2408, 500, 1701, 4500}
+		// 500/1701/4500 ahead of 2408: default port 2408 is the first UDP port
+		// targeted by ISP QoS/DPI throttling.
+		o.Ports = []int{500, 1701, 4500, 2408}
 	}
 }
 
@@ -286,10 +288,96 @@ func dialWGTunnel(ctx context.Context, o Options, run protoRun) (*Session, error
 			return s, nil
 		}
 	}
+
+	// Primary UDP ports often fake-handshake while DPI drops data packets. When
+	// budget remains and no explicit endpoint was pinned, rotate AWG junk params
+	// and try a sampled batch of extendedWarpPorts before giving up.
+	if o.Endpoint == "" && ctx.Err() == nil && time.Until(deadline) >= 6*time.Second {
+		altPorts := sampleExtendedPorts(o.Ports, 8)
+		if len(altPorts) > 0 {
+			if run.isAWG() {
+				genJunkParams()
+				if altTn, nerr := newTunnel(run); nerr == nil {
+					tn.Close()
+					tn = altTn
+				}
+			}
+			o.report(fmt.Sprintf("主端口均不可用，切换备用冷门端口 %v 重试…", altPorts))
+			for _, port := range altPorts {
+				for _, ip := range cands {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					if time.Now().After(deadline) {
+						break
+					}
+					attempts++
+					endpoint := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+					if !tn.handshake(ctx, endpoint, o.HandshakeTimeout) {
+						continue
+					}
+					o.report(fmt.Sprintf("%s 握手成功，验证出口…", endpoint))
+					start := time.Now()
+					body, why, passed := egressProbeReason(ctx, tn, o.VerifyTimeout)
+					if !passed {
+						lastErr = fmt.Errorf("%s 握手成功但数据面不通（%s）", endpoint, why)
+						o.report(fmt.Sprintf("%s 数据面不通（%s），换下一个", endpoint, why))
+						continue
+					}
+					s := &Session{
+						tn:       tn,
+						Endpoint: endpoint,
+						RTT:      time.Since(start),
+					}
+					s.applyMeta(body)
+					if s.ExitIP == "" && s.Country == "" {
+						o.report("警告：出口信息解析为空（/meta 被拒），但数据面已验证")
+					} else {
+						o.report(fmt.Sprintf("出口 %s (%s)", s.ExitIP, s.Country))
+					}
+					if o.SocksListen != "" {
+						if !s.startSocksAt(ctx, o.SocksListen, o.report, o.Rules, o.SocksInternal) && o.SocksRequired {
+							return nil, fmt.Errorf("本地 SOCKS 端口 %s 起不来，而它这次是必需的（后续流程要连它）", o.SocksListen)
+						}
+					}
+					ok = true
+					return s, nil
+				}
+				if time.Now().After(deadline) {
+					break
+				}
+			}
+		}
+	}
+
 	if lastErr != nil {
 		return nil, fmt.Errorf("没有可用端点（%d 次尝试，最后一个错误：%v）", attempts, lastErr)
 	}
 	return nil, fmt.Errorf("没有可用端点：%d 次尝试都没握手成功", attempts)
+}
+
+func sampleExtendedPorts(exclude []int, maxPorts int) []int {
+	skip := make(map[int]bool, len(exclude))
+	for _, p := range exclude {
+		skip[p] = true
+	}
+	pool := make([]int, 0, len(extendedWarpPorts))
+	for _, p := range extendedWarpPorts {
+		if !skip[p] {
+			pool = append(pool, p)
+		}
+	}
+	if len(pool) <= maxPorts {
+		return pool
+	}
+	// Deterministic spread across the port range so both low (854..) and high
+	// (2371..8886) UDP ports are covered without spending minutes.
+	step := len(pool) / maxPorts
+	out := make([]int, 0, maxPorts)
+	for i := 0; i < len(pool) && len(out) < maxPorts; i += step {
+		out = append(out, pool[i])
+	}
+	return out
 }
 
 // candidates 组装要试的端点 IP。钉了 Endpoint 就只试它。

@@ -301,10 +301,12 @@ object EngineBridge {
                         operator = n.optString("operator"),
                         pingMs = n.optInt("pingMS"),
                         speedBps = n.optInt("speedBps"),
+                        sessions = n.optInt("sessions", 0),
                         latencyMs = n.optInt("latencyMS"),
                         cls = n.optString("class", "unknown"),
                         classSource = n.optString("classSource"),
                         shared = n.optBoolean("shared"),
+                        stale = n.optBoolean("stale", false),
                         isp = n.optString("isp"),
                         asn = n.optString("as"),
                         measuredBps = speeds[n.optString("id")] ?: 0L,
@@ -535,10 +537,12 @@ data class VpnGateNode(
     val operator: String,
     val pingMs: Int,
     val speedBps: Int,
+    val sessions: Int = 0,
     val latencyMs: Int,
     val cls: String,
     val classSource: String,
     val shared: Boolean,
+    val stale: Boolean = false,
     val isp: String,
     val asn: String,
     /**
@@ -577,6 +581,22 @@ data class VpnGateNode(
         "datacenter" -> "机房"
         else -> "未分类"
     }
+
+    /** 综合带宽、在线人数与延迟估算单用户质量（惩罚 60+ 拥挤节点与 0 会话半死节点）。 */
+    fun qualityScore(): Long {
+        if (speedBps <= 0) return 0L
+        val sess = sessions.coerceAtLeast(0)
+        var perUser = speedBps.toLong() / (sess + 5L)
+        if (sess == 0) {
+            perUser /= 4L
+        } else if (sess >= 60) {
+            perUser /= 2L
+        }
+        var lat = (if (latencyMs > 0) latencyMs else pingMs).toLong()
+        if (lat <= 0L) lat = 100L
+        if (lat < 30L) lat = 30L
+        return perUser / (lat + 120L)
+    }
 }
 
 /** 节点排序里「真握手」的分档：通 < 没测过 < 失败。 */
@@ -603,18 +623,21 @@ private fun probeRankOf(n: VpnGateNode): Int = when {
  * 自动的时候优先选最快的那个，而不是「看起来最近的那个」。
  */
 internal val vpnGateNodeOrder: Comparator<VpnGateNode> =
-    compareBy<VpnGateNode> {
-        when (it.cls) {
-            "residential" -> 0
-            "unknown", "degraded" -> 1
-            else -> 2
+    compareBy<VpnGateNode> { if (it.stale) 1 else 0 }
+        .thenBy {
+            when (it.cls) {
+                "residential" -> 0
+                "unknown", "degraded" -> 1
+                else -> 2
+            }
         }
-    }
         .thenBy { probeRankOf(it) }
+        .thenBy { if (it.proto.equals("tcp", ignoreCase = true)) 0 else 1 }
         .thenBy { NodeSpeedStore.tier(it.measuredBps) }
         .thenByDescending { it.measuredBps }
         .thenBy { if (it.hasProbe && it.handshakeOk) it.handshakeMs else 0 }
         .thenBy { if (it.hasMeasuredLatency) 0 else 1 }
+        .thenByDescending { it.qualityScore() }
         .thenBy { it.latencyMs.takeIf { l -> l > 0 } ?: it.pingMs }
 
 /** 从 assets 读一个文本文件；不存在或读失败都返回 null（不抛）。 */

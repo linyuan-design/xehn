@@ -69,14 +69,14 @@ func TestEnrichClassify(t *testing.T) {
 			want: "datacenter",
 		},
 		{
-			name: "证据不足",
+			name: "证据不足（归入家宽兜底）",
 			r:    ipAPIResult{Status: "success", ISP: "Some LLC", AS: "AS64500 Some LLC"},
-			want: "unknown",
+			want: "residential",
 		},
 		{
-			name: "机房与住宅冲突",
+			name: "机房与住宅冲突（归入机房）",
 			r:    ipAPIResult{Status: "success", ISP: "SoftBank", AS: "AS17676 SoftBank", Hosting: true},
-			want: "unknown",
+			want: "datacenter",
 		},
 	}
 	for _, c := range cases {
